@@ -16,6 +16,7 @@ LORA_TRAIN_CONFIG_FIELDS = (
     "lora_dropout",
     "lora_bias",
     "lora_target_modules",
+    "lora_modules_to_save",
 )
 
 LORA_ADAPTER_CONFIG_NAME = "adapter_config.json"
@@ -158,12 +159,41 @@ def resolve_lora_target_modules(spec: str | Sequence[str] | None) -> str | list[
     return modules
 
 
-def build_lora_config_kwargs(raw: TrainConfig | Mapping[str, Any]) -> dict[str, Any]:
+def resolve_lora_modules_to_save(
+    spec: str | Sequence[str] | None,
+    *,
+    use_duration_predictor: bool,
+) -> list[str] | None:
+    if spec is None:
+        return None
+
+    if isinstance(spec, str):
+        value = spec.strip()
+        if not value or value.lower() == "none":
+            return None
+        if value.lower() == "auto":
+            if use_duration_predictor:
+                return ["duration_predictor"]
+            return None
+        modules = [chunk.strip() for chunk in value.split(",") if chunk.strip()]
+    else:
+        modules = [str(item).strip() for item in spec if str(item).strip()]
+
+    if not modules:
+        return None
+    return modules
+
+
+def build_lora_config_kwargs(
+    raw: TrainConfig | Mapping[str, Any],
+    *,
+    use_duration_predictor: bool = False,
+) -> dict[str, Any]:
     bias = str(_lookup_config_value(raw, "lora_bias")).strip().lower()
     if bias not in {"none", "all", "lora_only"}:
         raise ValueError(f"Unsupported lora_bias={bias!r}. Expected one of: none, all, lora_only.")
 
-    return {
+    kwargs = {
         "r": int(_lookup_config_value(raw, "lora_r")),
         "lora_alpha": int(_lookup_config_value(raw, "lora_alpha")),
         "lora_dropout": float(_lookup_config_value(raw, "lora_dropout")),
@@ -172,6 +202,13 @@ def build_lora_config_kwargs(raw: TrainConfig | Mapping[str, Any]) -> dict[str, 
             _lookup_config_value(raw, "lora_target_modules")
         ),
     }
+    modules_to_save = resolve_lora_modules_to_save(
+        _lookup_config_value(raw, "lora_modules_to_save"),
+        use_duration_predictor=use_duration_predictor,
+    )
+    if modules_to_save is not None:
+        kwargs["modules_to_save"] = modules_to_save
+    return kwargs
 
 
 def apply_lora(
@@ -187,7 +224,10 @@ def apply_lora(
         lora_config_cls(
             task_type=None,
             inference_mode=False,
-            **build_lora_config_kwargs(raw),
+            **build_lora_config_kwargs(
+                raw,
+                use_duration_predictor=bool(model.cfg.use_duration_predictor),
+            ),
         ),
     )
     return peft_model

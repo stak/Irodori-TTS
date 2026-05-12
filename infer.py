@@ -16,8 +16,6 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 
-FIXED_SECONDS = 30.0
-
 
 def _parse_optional_float(value: str) -> float | None:
     raw = str(value).strip().lower()
@@ -119,13 +117,7 @@ def main() -> None:
         "--codec-deterministic-decode",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use deterministic DACVAE decode watermark-message path (default: enabled).",
-    )
-    parser.add_argument(
-        "--enable-watermark",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable DACVAE watermark branch during decode (default: disabled).",
+        help="Use deterministic DACVAE decode path (default: enabled).",
     )
     parser.add_argument(
         "--max-ref-seconds",
@@ -172,6 +164,21 @@ def main() -> None:
         ),
     )
     parser.add_argument("--num-steps", type=int, default=40)
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help=(
+            "Manual output duration in seconds. If omitted, duration-enabled checkpoints "
+            "predict duration automatically; older checkpoints fall back to 30s."
+        ),
+    )
+    parser.add_argument(
+        "--duration-scale",
+        type=float,
+        default=1.0,
+        help="Scale predicted duration when --seconds is omitted (>1 longer, <1 shorter).",
+    )
     parser.add_argument(
         "--num-candidates",
         type=int,
@@ -334,7 +341,6 @@ def main() -> None:
             codec_precision=str(args.codec_precision),
             codec_deterministic_encode=bool(args.codec_deterministic_encode),
             codec_deterministic_decode=bool(args.codec_deterministic_decode),
-            enable_watermark=bool(args.enable_watermark),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
         )
@@ -372,7 +378,8 @@ def main() -> None:
             ref_ensure_max=bool(args.ref_ensure_max),
             num_candidates=int(args.num_candidates),
             decode_mode=str(args.decode_mode),
-            seconds=FIXED_SECONDS,
+            seconds=None if args.seconds is None else float(args.seconds),
+            duration_scale=float(args.duration_scale),
             max_ref_seconds=float(args.max_ref_seconds)
             if args.max_ref_seconds is not None
             else None,

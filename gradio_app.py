@@ -8,6 +8,7 @@ from pathlib import Path
 import gradio as gr
 from huggingface_hub import hf_hub_download
 
+from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
@@ -19,7 +20,6 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 
-FIXED_SECONDS = 30.0
 MAX_GRADIO_CANDIDATES = 32
 GRADIO_AUDIO_COLS_PER_ROW = 8
 
@@ -32,7 +32,7 @@ def _default_checkpoint() -> str:
         ]
     )
     if not candidates:
-        return "Aratako/Irodori-TTS-500M-v2"
+        return "Aratako/Irodori-TTS-500M-v3"
     return str(candidates[-1])
 
 
@@ -117,7 +117,6 @@ def _build_runtime_key(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
 ) -> RuntimeKey:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
     return RuntimeKey(
@@ -127,7 +126,6 @@ def _build_runtime_key(
         model_precision=str(model_precision),
         codec_device=str(codec_device),
         codec_precision=str(codec_precision),
-        enable_watermark=bool(enable_watermark),
         compile_model=False,
         compile_dynamic=False,
     )
@@ -139,7 +137,6 @@ def _load_model(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -147,7 +144,6 @@ def _load_model(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
-        enable_watermark=enable_watermark,
     )
     _, reloaded = get_cached_runtime(runtime_key)
     if reloaded:
@@ -170,12 +166,13 @@ def _run_generation(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
     text: str,
     uploaded_audio: str | None,
     num_steps: int,
     num_candidates: int,
     seed_raw: str,
+    seconds_raw: str,
+    duration_scale: float,
     cfg_guidance_mode: str,
     cfg_scale_text: float,
     cfg_scale_speaker: float,
@@ -199,7 +196,6 @@ def _run_generation(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
-        enable_watermark=enable_watermark,
     )
 
     if str(text).strip() == "":
@@ -218,6 +214,7 @@ def _run_generation(
     speaker_kv_min_t = _parse_optional_float(speaker_kv_min_t_raw, "speaker_kv_min_t")
     speaker_kv_max_layers = _parse_optional_int(speaker_kv_max_layers_raw, "speaker_kv_max_layers")
     seed = _parse_optional_int(seed_raw, "seed")
+    manual_seconds = _parse_optional_float(seconds_raw, "seconds")
 
     ref_wav = _resolve_ref_wav(uploaded_audio=uploaded_audio)
     no_ref = ref_wav is None
@@ -229,15 +226,15 @@ def _run_generation(
     stdout_log(
         (
             "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "watermark={} mode={} seconds={} steps={} seed={} no_ref={} candidates={}"
+            "mode={} seconds={} duration_scale={} steps={} seed={} no_ref={} candidates={}"
         ).format(
             model_device,
             model_precision,
             codec_device,
             codec_precision,
-            enable_watermark,
             cfg_guidance_mode,
-            FIXED_SECONDS,
+            "auto" if manual_seconds is None else manual_seconds,
+            duration_scale,
             num_steps,
             "random" if seed is None else seed,
             no_ref,
@@ -255,7 +252,8 @@ def _run_generation(
             ref_ensure_max=bool(ref_ensure_max),
             num_candidates=requested_candidates,
             decode_mode="sequential",
-            seconds=FIXED_SECONDS,
+            seconds=manual_seconds,
+            duration_scale=float(duration_scale),
             max_ref_seconds=30.0,
             max_text_len=None,
             num_steps=int(num_steps),
@@ -360,14 +358,19 @@ def build_ui() -> gr.Blocks:
                 value=codec_precision_choices[0],
                 scale=1,
             )
-            enable_watermark = gr.State(False)
 
         with gr.Row():
             load_model_btn = gr.Button("Load Model")
             clear_cache_btn = gr.Button("Unload Model")
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
-        text = gr.Textbox(label="Text", lines=4)
+        with gr.Column():
+            text = gr.Textbox(
+                label="Text",
+                lines=6,
+                elem_id="irodori-text-input",
+            )
+            build_emoji_palette(text, open=False)
         uploaded_audio = gr.Audio(
             label="Reference Audio Upload (optional, blank = no-reference mode)",
             type="filepath",
@@ -384,6 +387,14 @@ def build_ui() -> gr.Blocks:
                     step=1,
                 )
                 seed_raw = gr.Textbox(label="Seed (blank=random)", value="")
+                seconds_raw = gr.Textbox(label="Seconds (blank=auto)", value="")
+                duration_scale = gr.Slider(
+                    label="Duration Scale",
+                    minimum=0.5,
+                    maximum=1.5,
+                    value=1.0,
+                    step=0.01,
+                )
 
             with gr.Row():
                 cfg_guidance_mode = gr.Dropdown(
@@ -456,12 +467,13 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
-                enable_watermark,
                 text,
                 uploaded_audio,
                 num_steps,
                 num_candidates,
                 seed_raw,
+                seconds_raw,
+                duration_scale,
                 cfg_guidance_mode,
                 cfg_scale_text,
                 cfg_scale_speaker,
@@ -493,7 +505,6 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
-                enable_watermark,
             ],
             outputs=[clear_cache_msg],
         )
@@ -517,6 +528,7 @@ def main() -> None:
         server_port=args.server_port,
         share=bool(args.share),
         debug=bool(args.debug),
+        css=EMOJI_PALETTE_CSS,
     )
 
 
