@@ -28,7 +28,7 @@ For model weights and audio samples, please refer to the [base model card](https
 - **Emoji-based Style Control**: Emoji annotations in input text can influence delivery and non-verbal vocal expressions in supported checkpoints
 - **Automatic Duration Prediction**: v3 base and v3 VoiceDesign checkpoints estimate output length without manual `--seconds`
 - **Automatic Watermarking**: Generated audio is watermarked with [SilentCipher](https://github.com/sony/silentcipher) when available
-- **Multi-GPU Training**: Distributed training via `uv run torchrun` with gradient accumulation, mixed precision (bf16), and W&B logging
+- **Multi-GPU Training**: Distributed training via `uv run --no-sync torchrun` with gradient accumulation, mixed precision (bf16), and W&B logging
 - **PEFT LoRA Fine-Tuning**: Parameter-efficient adaptation with PEFT/LoRA for released checkpoints
 - **Speaker Inversion**: Learn reusable speaker embedding tokens for a target voice while freezing the base model
 - **Flexible Inference**: CLI, Gradio Web UI, and HuggingFace Hub checkpoint support
@@ -83,6 +83,10 @@ Linux, and the `xpu` extra uses the PyTorch XPU index on Linux/Windows.
 The `cpu` extra uses the CPU PyTorch index on Linux/Windows and falls
 back to the standard PyPI PyTorch wheels on macOS.
 
+After syncing with a backend extra, use `uv run --no-sync ...` for the commands
+below to avoid re-syncing the environment without the selected PyTorch backend
+extra.
+
 The `rocm` extra includes `pytorch-triton-rocm` because `triton-rocm` alone does
 not provide `triton.language` for the `transformers` to `torch._dynamo` import
 path. This was validated with AMD GPU inference.
@@ -92,7 +96,7 @@ path. This was validated with AMD GPU inference.
 ### Simple Inference
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --ref-wav path/to/reference.wav \
@@ -102,7 +106,7 @@ uv run python infer.py \
 ### Inference without Reference Audio
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --no-ref \
@@ -114,7 +118,7 @@ uv run python infer.py \
 Pure VoiceDesign from text + caption:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-600M-v3-VoiceDesign \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --caption "落ち着いた女性の声で、近い距離感でやわらかく自然に読み上げてください。" \
@@ -125,7 +129,7 @@ uv run python infer.py \
 Style-controlled voice cloning with text + reference speech + caption:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-600M-v3-VoiceDesign \
   --text "どうしてもっと早く教えてくれなかったの？私、ずっと待ってたのに。" \
   --ref-wav path/to/reference.wav \
@@ -138,7 +142,7 @@ uv run python infer.py \
 Use a learned Speaker Inversion embedding instead of reference audio:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --checkpoint path/to/Irodori-TTS-500M-v3.safetensors \
   --ref-embed path/to/my.speaker.safetensors \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
@@ -148,7 +152,7 @@ uv run python infer.py \
 ### Gradio Web UI
 
 ```bash
-uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
+uv run --no-sync python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 ```
 
 Then access the UI at `http://localhost:7860`.
@@ -158,7 +162,7 @@ The reference input area supports either reference audio/latent input or a Speak
 For VoiceDesign checkpoints, use the dedicated UI:
 
 ```bash
-uv run python gradio_app_voicedesign.py --server-name 0.0.0.0 --server-port 7861
+uv run --no-sync python gradio_app_voicedesign.py --server-name 0.0.0.0 --server-port 7861
 ```
 
 The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-600M-v3-VoiceDesign-Demo](https://huggingface.co/spaces/Aratako/Irodori-TTS-600M-v3-VoiceDesign-Demo).
@@ -170,7 +174,7 @@ The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-600M-v3-VoiceDe
 ### CLI
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --ref-wav path/to/reference.wav \
@@ -180,7 +184,7 @@ uv run python infer.py \
 Local checkpoints (`.pt` or `.safetensors`) are also supported:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --checkpoint outputs/checkpoint_final.safetensors \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --ref-wav path/to/reference.wav \
@@ -192,7 +196,7 @@ caption only by passing `--no-ref`, or with both reference speech and caption by
 `--ref-wav`, `--ref-latent`, or `--ref-embed`.
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-600M-v3-VoiceDesign \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --caption "落ち着いた、近い距離感の女性話者" \
@@ -201,7 +205,7 @@ uv run python infer.py \
 ```
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-600M-v3-VoiceDesign \
   --text "あははっ🤭、それ本当に言ってるの？…😮‍💨まぁ、君らしいけどね。" \
   --caption "余裕のある大人の男性。親しい相手に対して、くだけた雰囲気で呆れながらも楽しそうに話している。" \
@@ -215,7 +219,7 @@ LoRA adapter directories can be loaded dynamically at inference time without
 exporting a merged checkpoint:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --checkpoint path/to/base_model.safetensors \
   --lora-adapter outputs/irodori_tts_lora/checkpoint_final \
   --text "こんにちは、私はAIです。これはLoRA推論のテストです。" \
@@ -228,7 +232,7 @@ was used for inversion training. Pass the embedding with `--ref-embed`;
 it is mutually exclusive with `--ref-wav`, `--ref-latent`, and `--no-ref`.
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --checkpoint path/to/Irodori-TTS-500M-v3.safetensors \
   --ref-embed outputs/speaker_inversion/name/checkpoint_final.speaker.safetensors \
   --text "こんにちは、私はAIです。これはSpeaker Inversion推論のテストです。" \
@@ -254,7 +258,7 @@ For faster experimental inference, Sway Sampling can be combined with fewer Eule
 steps:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "こんにちは、私はAIです。これは音声合成のテストです。" \
   --ref-wav path/to/reference.wav \
@@ -278,7 +282,7 @@ Generated audio is passed through [SilentCipher](https://github.com/sony/silentc
 Encodes audio from a Hugging Face dataset into DACVAE latents and produces a JSONL manifest for training.
 
 ```bash
-uv run python prepare_manifest.py \
+uv run --no-sync python prepare_manifest.py \
   --dataset myorg/my_dataset \
   --split train \
   --audio-column audio \
@@ -291,7 +295,7 @@ uv run python prepare_manifest.py \
 To include `speaker_id` in the manifest (for speaker-conditioned training):
 
 ```bash
-uv run python prepare_manifest.py \
+uv run --no-sync python prepare_manifest.py \
   --dataset myorg/my_dataset \
   --split train \
   --audio-column audio \
@@ -305,7 +309,7 @@ uv run python prepare_manifest.py \
 To include `caption` in the manifest (for caption-conditioned voice design training):
 
 ```bash
-uv run python prepare_manifest.py \
+uv run --no-sync python prepare_manifest.py \
   --dataset myorg/my_dataset \
   --split train \
   --audio-column audio \
@@ -340,7 +344,7 @@ This produces a JSONL manifest with entries like:
 Single-GPU training:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_phase1_body.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts
@@ -350,7 +354,7 @@ v3 release training uses two phases. After training the body, initialize the int
 duration predictor from the phase-1 checkpoint:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_phase2_duration.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_duration \
@@ -360,7 +364,7 @@ uv run python train.py \
 v2 VoiceDesign training uses a dedicated config:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v2_voice_design.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_voice_design
@@ -375,7 +379,7 @@ v3 base checkpoint while adding the caption branch and skipping the base duratio
 predictor:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_voice_design_phase1_body.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_voice_design_phase1 \
@@ -386,7 +390,7 @@ Phase 2 adds and trains a newly initialized duration predictor with text + speak
 caption conditioning:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_voice_design_phase2_duration.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_voice_design_phase2 \
@@ -410,14 +414,14 @@ guide for the architecture details.
 Multi-GPU DDP training:
 
 ```bash
-uv run torchrun --nproc_per_node 4 train.py \
+uv run --no-sync torchrun --nproc_per_node 4 train.py \
   --config configs/train_500m_v3_phase1_body.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts \
   --device cuda
 ```
 
-Training supports YAML config files with `model` and `train` sections. CLI arguments take precedence over YAML values. See `uv run python train.py --help` for all available options.
+Training supports YAML config files with `model` and `train` sections. CLI arguments take precedence over YAML values. See `uv run --no-sync python train.py --help` for all available options.
 For a more detailed explanation of model and training config fields, see [Parameter Guide](docs/parameters.md).
 
 #### Fine-Tuning from Released Weights
@@ -425,7 +429,7 @@ For a more detailed explanation of model and training config fields, see [Parame
 Start a new training run from released inference weights (`.safetensors`). This initializes only the model weights; optimizer / scheduler state starts fresh. For the v3 base release, the LoRA config keeps the duration predictor as part of the saved adapter by default.
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_lora.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_lora \
@@ -435,7 +439,7 @@ uv run python train.py \
 v3 VoiceDesign LoRA fine-tuning:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_voice_design_lora.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_voice_design_lora \
@@ -458,7 +462,7 @@ Prepare a manifest from the target speaker's audio, then initialize from the rel
 base checkpoint:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_speaker_inversion.yaml \
   --manifest data/target_speaker_manifest.jsonl \
   --init-checkpoint path/to/Irodori-TTS-500M-v3.safetensors \
@@ -470,7 +474,7 @@ The saved checkpoints are embedding-only `.speaker.safetensors` files, for examp
 with the base model during inference:
 
 ```bash
-uv run python infer.py \
+uv run --no-sync python infer.py \
   --checkpoint path/to/Irodori-TTS-500M-v3.safetensors \
   --ref-embed outputs/speaker_inversion/name/checkpoint_final.speaker.safetensors \
   --text "こんにちは、これは学習した話者埋め込みを使った推論です。" \
@@ -487,7 +491,7 @@ Enable `gradient_checkpointing: true` or pass `--gradient-checkpointing` if GPU 
 Resume an existing training run from a training checkpoint. Full-model runs use `.pt`; LoRA runs use checkpoint directories. Both restore optimizer, scheduler, and step state.
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_phase1_body.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts \
@@ -497,7 +501,7 @@ uv run python train.py \
 LoRA resume example:
 
 ```bash
-uv run python train.py \
+uv run --no-sync python train.py \
   --config configs/train_500m_v3_lora.yaml \
   --manifest data/train_manifest.jsonl \
   --output-dir outputs/irodori_tts_lora \
@@ -511,13 +515,13 @@ If you move a LoRA checkpoint to another environment and the original base-check
 Convert a training checkpoint to inference-only safetensors format:
 
 ```bash
-uv run python convert_checkpoint_to_safetensors.py outputs/checkpoint_final.pt
+uv run --no-sync python convert_checkpoint_to_safetensors.py outputs/checkpoint_final.pt
 ```
 
 LoRA adapter checkpoints can also be converted directly:
 
 ```bash
-uv run python convert_checkpoint_to_safetensors.py outputs/irodori_tts_lora/checkpoint_final
+uv run --no-sync python convert_checkpoint_to_safetensors.py outputs/irodori_tts_lora/checkpoint_final
 ```
 
 LoRA adapter checkpoints are merged into the base model automatically during conversion, so the exported `.safetensors` file is directly usable for inference. If you do not want to merge the adapter, pass the adapter directory directly to `infer.py --lora-adapter` or the matching Gradio field.
