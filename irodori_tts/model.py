@@ -42,14 +42,24 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_.type_as(x)
 
 
+_TIMESTEP_FREQS_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
-    freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
-        * torch.arange(half, device=timestep.device, dtype=torch.float32)
-        / half
-    )
+    # Cache the frequency table per (device, half). Recomputing it every call
+    # issued a host-to-device copy (torch.tensor on CUDA), which is slow and
+    # not permitted inside CUDA graph capture.
+    cache_key = (timestep.device, half)
+    freqs = _TIMESTEP_FREQS_CACHE.get(cache_key)
+    if freqs is None:
+        freqs = 1000.0 * torch.exp(
+            -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
+            * torch.arange(half, device=timestep.device, dtype=torch.float32)
+            / half
+        )
+        _TIMESTEP_FREQS_CACHE[cache_key] = freqs
     args = timestep[:, None].float() * freqs[None, :]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
 

@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import secrets
 import threading
 import time
@@ -67,7 +68,9 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         if not _is_xpu_available():
             raise ValueError("XPU device requested but torch.xpu.is_available() is False.")
         return torch.device("xpu")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu.")
+    raise ValueError(
+        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu."
+    )
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -91,6 +94,32 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
+
+
+_FAST_MATH_CONFIGURED = False
+
+
+def _enable_cuda_fast_math() -> None:
+    """
+    Allow TF32 tensor-core execution for fp32 matmuls/convolutions and enable
+    cuDNN autotuning. Gives a large speedup on Ampere+ GPUs with negligible
+    numerical impact. Opt out with IRODORI_DISABLE_TF32=1.
+    """
+    global _FAST_MATH_CONFIGURED
+    if _FAST_MATH_CONFIGURED:
+        return
+    if os.environ.get("IRODORI_DISABLE_TF32", "0").strip() == "1":
+        _FAST_MATH_CONFIGURED = True
+        return
+    # TF32 for matmuls only. Empirically, forcing TF32/cudnn-benchmark on the
+    # codec's convolutional decoder can select much slower conv algorithms, so
+    # convolutions are left at default fp32 behavior.
+    try:
+        # PyTorch >= 2.9 fp32 precision API.
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    except Exception:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    _FAST_MATH_CONFIGURED = True
 
 
 def _sync_device(device: torch.device) -> None:
@@ -167,12 +196,17 @@ def find_flattening_point(
         dtype=latent.dtype,
     )
     padded = torch.cat([latent, pad], dim=0)
-    for i in range(padded.shape[0] - window_size):
-        window = padded[i : i + window_size]
-        window_std = window.std(unbiased=False)
-        window_mean = window.mean()
-        if window_std < std_threshold and torch.abs(window_mean - target_value) < mean_threshold:
-            return int(i)
+    # Vectorized over all trailing windows (equivalent to the original per-window
+    # loop, but with a single device sync instead of one per window).
+    num_windows = padded.shape[0] - window_size
+    windows = padded.unfold(0, window_size, 1)[:num_windows]  # (N, D, W)
+    flat = windows.reshape(num_windows, -1)
+    window_std = flat.std(dim=1, unbiased=False)
+    window_mean = flat.mean(dim=1)
+    hits = (window_std < std_threshold) & (torch.abs(window_mean - target_value) < mean_threshold)
+    first_hit = int(torch.argmax(hits.to(torch.int8)).item()) if bool(hits.any().item()) else -1
+    if first_hit >= 0:
+        return first_hit
     return total_steps
 
 
@@ -492,6 +526,8 @@ class InferenceRuntime:
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
+        if model_device.type == "cuda" or codec_device.type == "cuda":
+            _enable_cuda_fast_math()
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
@@ -1008,6 +1044,7 @@ class InferenceRuntime:
                 _log(msg)
             _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
+            encoded_conditions = None
             hop_length = int(self.codec.model.hop_length)
             if manual_seconds is not None:
                 clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
@@ -1038,14 +1075,7 @@ class InferenceRuntime:
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
                 ).to(self.model_device)
-                (
-                    duration_text_state,
-                    duration_text_mask,
-                    duration_speaker_state,
-                    _duration_speaker_mask,
-                    _duration_caption_state,
-                    _duration_caption_mask,
-                ) = self.model.encode_conditions(
+                encoded_conditions = self.model.encode_conditions(
                     text_input_ids=text_ids,
                     text_mask=text_mask,
                     ref_latent=ref_latent,
@@ -1056,6 +1086,14 @@ class InferenceRuntime:
                     speaker_mask_override=speaker_mask_override,
                     speaker_uncond_mode=req.speaker_uncond_mode,
                 )
+                (
+                    duration_text_state,
+                    duration_text_mask,
+                    duration_speaker_state,
+                    _duration_speaker_mask,
+                    _duration_caption_state,
+                    _duration_caption_mask,
+                ) = encoded_conditions
                 pred_log_frames = self.model.predict_duration_log_frames(
                     text_state=duration_text_state,
                     text_mask=duration_text_mask,
@@ -1140,6 +1178,7 @@ class InferenceRuntime:
                 speaker_kv_min_t=speaker_kv_min_t,
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
+                encoded_conditions=encoded_conditions,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))

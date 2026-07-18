@@ -148,9 +148,23 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
+    encoded_conditions: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
+
+    Args:
+      encoded_conditions: Optional precomputed output of model.encode_conditions with
+        identical conditioning arguments; avoids re-encoding when the caller already
+        encoded conditions (e.g. for duration prediction).
 
     Returns:
       latent sequence in patched space, shape (B, sequence_length, patched_latent_dim)
@@ -211,10 +225,25 @@ def sample_euler_rf_cfg(
     t_schedule = (1.0 - u) * init_scale
     if not bool(torch.all(t_schedule[:-1] > t_schedule[1:]).item()):
         raise ValueError("t_schedule must be strictly decreasing; adjust num_steps or sway_coeff.")
+    # Materialize schedule as Python floats once, so the sampling loop below does not
+    # trigger a device sync per step via Tensor.item().
+    t_values = [float(v) for v in t_schedule.tolist()]
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
 
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
+            text_input_ids=text_input_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=caption_input_ids,
+            caption_mask=caption_mask,
+            speaker_state_override=speaker_state_override,
+            speaker_mask_override=speaker_mask_override,
+            speaker_uncond_mode=speaker_uncond_mode,
+        )
     (
         text_state_cond,
         text_mask_cond,
@@ -222,17 +251,7 @@ def sample_euler_rf_cfg(
         speaker_mask_cond,
         caption_state_cond,
         caption_mask_cond,
-    ) = model.encode_conditions(
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
-        caption_input_ids=caption_input_ids,
-        caption_mask=caption_mask,
-        speaker_state_override=speaker_state_override,
-        speaker_mask_override=speaker_mask_override,
-        speaker_uncond_mode=speaker_uncond_mode,
-    )
+    ) = encoded_conditions
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None
@@ -462,80 +481,79 @@ def sample_euler_rf_cfg(
     speaker_kv_active = speaker_kv_scale is not None
 
     for i in range(num_steps):
-        t = t_schedule[i]
-        t_next = t_schedule[i + 1]
+        t = t_values[i]
+        t_next = t_values[i + 1]
         tt = torch.full((batch_size,), t, device=device, dtype=dtype)
 
-        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t.item() <= cfg_max_t)
-        if use_cfg:
-            if use_independent_cfg:
-                x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
-                tt_cfg = tt.repeat(cfg_batch_mult)
-                v_out = model.forward_with_encoded_conditions(
-                    x_t=x_t_cfg,
-                    t=tt_cfg,
-                    text_state=independent_text_state,
-                    text_mask=independent_text_mask,
-                    speaker_state=independent_speaker_state,
-                    speaker_mask=independent_speaker_mask,
-                    caption_state=independent_caption_state,
-                    caption_mask=independent_caption_mask,
-                    context_kv_cache=context_kv_cfg,
-                )
-                chunks = v_out.chunk(cfg_batch_mult, dim=0)
-                v = chunks[0]
-                for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
-                    v = v + cfg_scales[name] * (chunks[0] - chunk)
-            else:
-                v_cond = model.forward_with_encoded_conditions(
+        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t <= cfg_max_t)
+        if use_cfg and use_independent_cfg:
+            x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
+            tt_cfg = tt.repeat(cfg_batch_mult)
+            v_out = model.forward_with_encoded_conditions(
+                x_t=x_t_cfg,
+                t=tt_cfg,
+                text_state=independent_text_state,
+                text_mask=independent_text_mask,
+                speaker_state=independent_speaker_state,
+                speaker_mask=independent_speaker_mask,
+                caption_state=independent_caption_state,
+                caption_mask=independent_caption_mask,
+                context_kv_cache=context_kv_cfg,
+            )
+            chunks = v_out.chunk(cfg_batch_mult, dim=0)
+            v = chunks[0]
+            for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
+                v = v + cfg_scales[name] * (chunks[0] - chunk)
+        elif use_cfg:
+            v_cond = model.forward_with_encoded_conditions(
+                x_t=x_t.to(dtype),
+                t=tt,
+                text_state=text_state_cond,
+                text_mask=text_mask_cond,
+                speaker_state=speaker_state_cond,
+                speaker_mask=speaker_mask_cond,
+                caption_state=caption_state_cond,
+                caption_mask=caption_mask_cond,
+                context_kv_cache=context_kv_cond,
+            )
+            if use_joint_cfg:
+                if len(enabled_cfg_names) > 1:
+                    joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
+                    if max(joint_scales) - min(joint_scales) > 1e-6:
+                        raise ValueError(
+                            "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
+                            "set matching text/speaker/caption scales or use --cfg-scale."
+                        )
+                joint_scale = cfg_scales[enabled_cfg_names[0]]
+                v_uncond_joint = model.forward_with_encoded_conditions(
                     x_t=x_t.to(dtype),
                     t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    caption_state=caption_state_cond,
-                    caption_mask=caption_mask_cond,
-                    context_kv_cache=context_kv_cond,
+                    text_state=joint_uncond_bundle[0],
+                    text_mask=joint_uncond_bundle[1],
+                    speaker_state=joint_uncond_bundle[2],
+                    speaker_mask=joint_uncond_bundle[3],
+                    caption_state=joint_uncond_bundle[4],
+                    caption_mask=joint_uncond_bundle[5],
+                    context_kv_cache=context_kv_joint_uncond,
                 )
-                if use_joint_cfg:
-                    if len(enabled_cfg_names) > 1:
-                        joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
-                        if max(joint_scales) - min(joint_scales) > 1e-6:
-                            raise ValueError(
-                                "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
-                                "set matching text/speaker/caption scales or use --cfg-scale."
-                            )
-                    joint_scale = cfg_scales[enabled_cfg_names[0]]
-                    v_uncond_joint = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=joint_uncond_bundle[0],
-                        text_mask=joint_uncond_bundle[1],
-                        speaker_state=joint_uncond_bundle[2],
-                        speaker_mask=joint_uncond_bundle[3],
-                        caption_state=joint_uncond_bundle[4],
-                        caption_mask=joint_uncond_bundle[5],
-                        context_kv_cache=context_kv_joint_uncond,
-                    )
-                    v = v_cond + joint_scale * (v_cond - v_uncond_joint)
-                elif use_alternating_cfg:
-                    alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
-                    alt_bundle = alternating_bundles[alt_name]
-                    v_uncond_alt = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=alt_bundle[0],
-                        text_mask=alt_bundle[1],
-                        speaker_state=alt_bundle[2],
-                        speaker_mask=alt_bundle[3],
-                        caption_state=alt_bundle[4],
-                        caption_mask=alt_bundle[5],
-                        context_kv_cache=context_kv_alternating.get(alt_name),
-                    )
-                    v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
-                else:
-                    raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
+                v = v_cond + joint_scale * (v_cond - v_uncond_joint)
+            elif use_alternating_cfg:
+                alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
+                alt_bundle = alternating_bundles[alt_name]
+                v_uncond_alt = model.forward_with_encoded_conditions(
+                    x_t=x_t.to(dtype),
+                    t=tt,
+                    text_state=alt_bundle[0],
+                    text_mask=alt_bundle[1],
+                    speaker_state=alt_bundle[2],
+                    speaker_mask=alt_bundle[3],
+                    caption_state=alt_bundle[4],
+                    caption_mask=alt_bundle[5],
+                    context_kv_cache=context_kv_alternating.get(alt_name),
+                )
+                v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
+            else:
+                raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
         else:
             v = model.forward_with_encoded_conditions(
                 x_t=x_t.to(dtype),
