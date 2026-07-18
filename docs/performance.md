@@ -2,10 +2,10 @@
 
 This fork adds a set of inference-speed optimizations on top of upstream
 Irodori-TTS. On the reference setup (RTX 40-series, Windows, fp32, 40 steps,
-~4 s utterance, LoRA adapter, watermark enabled), steady-state
-`total_to_decode` in the Gradio app drops from **~1.0 s to ~0.45-0.5 s**, and
-further if the GPU is prevented from downclocking between requests (see
-[Latency variance](#latency-variance-gpu-clocks)).
+~4 s utterance, LoRA adapter, watermark enabled, locked GPU clocks),
+steady-state `total_to_decode` in the Gradio app drops from **~1.0 s to
+~0.24 s**. Without locked clocks, GPU power management adds run-to-run
+variance (see [Latency variance](#latency-variance-gpu-clocks)).
 
 All optimizations are inference-only. Training code paths are untouched.
 
@@ -22,6 +22,7 @@ All optimizations are inference-only. Training code paths are untouched.
 | CUDA per-step graph replay of the sampling loop | CUDA only | exact vs eager; see bucketing note | `IRODORI_DISABLE_CUDA_GRAPH=1` |
 | CUDA graph replay of condition encoding + duration prediction | CUDA only | exact (bit-identical vs eager) | `IRODORI_DISABLE_DURATION_GRAPH=1` |
 | fp16 codec decode (decoder-only, deterministic algorithms) | CUDA only | ~58-60 dB SNR vs fp32 (inaudible, deterministic) | `IRODORI_DISABLE_FP16_DECODE=1` |
+| Text-length bucketing (short texts padded to 64 instead of max_text_len) | all | ~41 dB SNR for short texts (inaudible, deterministic) | `IRODORI_TEXT_BUCKETS=0` |
 | Prewarm also warms codec decoder + watermarker | CUDA only | none | (part of Prewarm) |
 | Latent-length bucketing (graphs shared across lengths) | CUDA only | ~47 dB SNR when padding occurs (inaudible, deterministic) | `IRODORI_CUDA_GRAPH_BUCKET=1` |
 | Graph prewarm (runtime API + Gradio button) | CUDA only | - | (button; opt-in) |
@@ -59,22 +60,26 @@ available for CUDA). CUDA graph replay removes that overhead.
 | `IRODORI_DISABLE_CUDA_GRAPH` | `0` | `1` disables graph capture/replay entirely |
 | `IRODORI_DISABLE_DURATION_GRAPH` | `0` | `1` keeps condition encoding + duration prediction eager (sampler graphs unaffected) |
 | `IRODORI_DISABLE_FP16_DECODE` | `0` | `1` keeps the codec decoder in fp32 (exact decode, ~2x slower) |
+| `IRODORI_TEXT_BUCKETS` | `64` | Comma-separated text-length buckets (tokens); short texts are padded to the smallest fitting bucket instead of max_text_len. `0` or empty disables (upstream padding) |
 | `IRODORI_CUDA_GRAPH_BUCKET` | `16` | Latent-length bucket size in patched steps; `1` disables padding |
 | `IRODORI_CUDA_GRAPH_CACHE` | `64` | Max cached graph entries (per-entry VRAM is small; pool and condition buffers are shared) |
 
 Setting `IRODORI_DISABLE_TF32=1`, `IRODORI_DISABLE_LORA_MERGE=1`,
-`IRODORI_DISABLE_CUDA_GRAPH=1` and `IRODORI_DISABLE_FP16_DECODE=1` together
-reproduces upstream outputs **bit-identically** (the remaining optimizations
-are exact; `IRODORI_DISABLE_CUDA_GRAPH=1` also disables the duration graph).
+`IRODORI_DISABLE_CUDA_GRAPH=1`, `IRODORI_DISABLE_FP16_DECODE=1` and
+`IRODORI_TEXT_BUCKETS=0` together reproduces upstream outputs
+**bit-identically** (the remaining optimizations are exact;
+`IRODORI_DISABLE_CUDA_GRAPH=1` also disables the duration graph).
 
 ## Recommended Gradio Workflow
 
 1. Load Model.
 2. Fill in the LoRA Adapter Directory (if any) **before** prewarming.
 3. Press **Prewarm Graphs** (Prewarm Max Seconds bounds the covered duration
-   range; 15 s ≈ 24 buckets ≈ ~25-40 s one-time cost, ~0.5-1 GiB VRAM).
-   Prewarm also runs one dummy codec decode and watermark pass so the first
-   real request skips their one-time setup costs.
+   range; 15 s ≈ 24 latent buckets × 2 text buckets = 48 graphs ≈ ~50 s
+   one-time cost; each graph entry holds ~16 MiB of driver-side memory, so
+   this is roughly 1-1.5 GiB of VRAM). Prewarm also runs one dummy codec
+   decode and watermark pass so the first real request skips their one-time
+   setup costs.
 4. Generate. Any text whose predicted duration falls inside the prewarmed
    range takes the fast path from the first request.
 
@@ -127,6 +132,16 @@ from upstream, all far below audibility:
   bit-identical to eager execution.
 - **LoRA hot-swap** (opt-in): each in-place unmerge/merge accumulates
   rounding on the order of the fp32 epsilon.
+- **Text-length bucketing** (default: bucket 64): texts of at most 64 tokens
+  are padded to 64 instead of the checkpoint's max_text_len (256), removing
+  ~190 masked keys from every cross-attention step (~-16 ms sample_rf, ~-9 ms
+  of it vs no bucketing at all for typical short texts). The masked math is
+  equivalent; kernel reduction order changes, measured ~41 dB SNR end to end
+  for short texts. Deterministic per text length. Duration features keep the
+  max_text_len normalization, so predicted durations are unaffected by the
+  bucket choice (identical predicted frames in verification); in rare
+  rounding-boundary cases the integer frame count could still differ by one.
+  Long texts (and requests with an explicit `max_text_len`) are unaffected.
 - **fp16 codec decode** (default on CUDA): the DACVAE decode-only modules
   (`quantizer.out_proj` + decoder) run in fp16 while the encoder stays fp32,
   so reference-audio encoding is unchanged. Measured ~60 dB SNR vs fp32

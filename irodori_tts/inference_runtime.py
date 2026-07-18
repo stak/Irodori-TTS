@@ -127,6 +127,29 @@ def _enable_cuda_fast_math() -> None:
     _FAST_MATH_CONFIGURED = True
 
 
+def _text_bucket_lengths() -> list[int]:
+    """
+    Text-length buckets (in tokens). Short texts are padded to the smallest
+    bucket that fits instead of the checkpoint's full max_text_len, shrinking
+    the per-step cross-attention over masked padding keys. Comma-separated in
+    IRODORI_TEXT_BUCKETS; empty or "0" disables bucketing (always pad to
+    max_text_len, the upstream behavior).
+    """
+    raw = os.environ.get("IRODORI_TEXT_BUCKETS", "64").strip()
+    if raw in {"", "0"}:
+        return []
+    lengths = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = int(part)
+        if value <= 0:
+            raise ValueError(f"IRODORI_TEXT_BUCKETS entries must be > 0, got {part!r}")
+        lengths.append(value)
+    return sorted(set(lengths))
+
+
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1311,6 +1334,22 @@ class InferenceRuntime:
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
+            # Text-length bucketing: pad short texts to the smallest bucket
+            # instead of the full max_text_len. Masked padding keys are
+            # mathematically inert but still cost cross-attention compute
+            # every step. Tokenization is right-padded, so slicing the padded
+            # batch equals re-encoding at the bucket length. Note that
+            # duration features keep the original max_text_len normalization
+            # (text_max_len below is unchanged), so predicted durations are
+            # unaffected by the bucket choice. Explicit max_text_len requests
+            # bypass bucketing.
+            if req.max_text_len is None:
+                token_count = int(text_mask.sum(dim=1).max())
+                for bucket_len in _text_bucket_lengths():
+                    if token_count <= bucket_len < text_ids.shape[1]:
+                        text_ids = text_ids[:, :bucket_len].contiguous()
+                        text_mask = text_mask[:, :bucket_len].contiguous()
+                        break
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
@@ -1622,13 +1661,28 @@ class InferenceRuntime:
         max_patched = math.ceil(max_frames / self.model_cfg.latent_patch_size)
         max_padded = ((max_patched + bucket - 1) // bucket) * bucket
         lengths = list(range(bucket, max_padded + 1, bucket))
+        # One sampler-graph entry is captured per (text bucket, latent bucket)
+        # pair; the largest text length (max_text_len, i.e. no bucketing) is
+        # always covered so long texts stay on the fast path.
+        text_lengths = sorted(
+            {
+                int(self.default_text_max_len),
+                *[
+                    b
+                    for b in _text_bucket_lengths()
+                    if b < int(self.default_text_max_len)
+                ],
+            },
+            reverse=True,
+        )
         max_entries = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_CACHE", "64")))
-        if len(lengths) > max_entries:
+        per_text_budget = max(1, max_entries // len(text_lengths))
+        if len(lengths) > per_text_budget:
             # Keep the shortest buckets: short utterances are by far the most
             # common, so they must stay covered when the cache cannot hold all.
-            lengths = lengths[:max_entries]
+            lengths = lengths[:per_text_budget]
             messages.append(
-                f"warning: prewarm truncated to {max_entries} buckets "
+                f"warning: prewarm truncated to {per_text_budget} latent buckets per text bucket "
                 f"(covers up to {lengths[-1] * self.model_cfg.latent_patch_size * hop_length / self.codec.sample_rate:.1f}s); "
                 "raise IRODORI_CUDA_GRAPH_CACHE or IRODORI_CUDA_GRAPH_BUCKET to cover more."
             )
@@ -1648,12 +1702,10 @@ class InferenceRuntime:
             ),
             torch.inference_mode(),
         ):
-            text_ids, text_mask = self.tokenizer.batch_encode(
+            text_ids_full, text_mask_full = self.tokenizer.batch_encode(
                 ["こんにちは。"] * int(num_candidates),
                 max_length=self.default_text_max_len,
             )
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
             caption_ids = None
             caption_mask = None
             if self.model_cfg.use_caption_condition and self.caption_tokenizer is not None:
@@ -1678,80 +1730,89 @@ class InferenceRuntime:
                 use_caption_condition=False,
                 use_speaker_condition=False,
             )
-            if self.model_cfg.use_duration_predictor:
-                # Capture the duration/condition graph too, so the first real
-                # request skips its one-time capture cost. Shapes (not values)
-                # key the graph, so the placeholder text is irrelevant.
-                prewarm_has_speaker = torch.zeros(
-                    (int(num_candidates),), dtype=torch.bool, device=self.model_device
-                )
-                if ref_mask is not None:
-                    prewarm_has_speaker = ref_mask.any(dim=1)
-                prewarm_features = build_duration_features(
-                    ["こんにちは。"] * int(num_candidates),
-                    token_counts=text_mask.sum(dim=1),
-                    max_text_len=self.default_text_max_len,
-                    has_speaker=prewarm_has_speaker,
-                ).to(self.model_device)
-                prewarm_has_caption = (
-                    torch.zeros(
-                        (int(num_candidates),), dtype=torch.bool, device=self.model_device
+            prewarm_has_speaker = torch.zeros(
+                (int(num_candidates),), dtype=torch.bool, device=self.model_device
+            )
+            if ref_mask is not None:
+                prewarm_has_speaker = ref_mask.any(dim=1)
+            prewarm_features = build_duration_features(
+                ["こんにちは。"] * int(num_candidates),
+                token_counts=text_mask_full.sum(dim=1),
+                max_text_len=self.default_text_max_len,
+                has_speaker=prewarm_has_speaker,
+            ).to(self.model_device)
+            prewarm_has_caption = (
+                torch.zeros((int(num_candidates),), dtype=torch.bool, device=self.model_device)
+                if self.model_cfg.use_caption_condition
+                else None
+            )
+            for text_len in text_lengths:
+                # Tokenization is right-padded, so slicing the full-length
+                # batch equals re-encoding at the bucket length.
+                text_ids = text_ids_full[:, :text_len].contiguous().to(self.model_device)
+                text_mask = text_mask_full[:, :text_len].contiguous().to(self.model_device)
+                if self.model_cfg.use_duration_predictor:
+                    # Capture the duration/condition graph too, so the first
+                    # real request skips its one-time capture cost. Shapes
+                    # (not values) key the graph, so the placeholder text is
+                    # irrelevant.
+                    encoded_conditions, _ = self._encode_and_predict_duration(
+                        text_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        caption_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        speaker_state_override=None,
+                        speaker_mask_override=None,
+                        speaker_uncond_mode="mask",
+                        duration_features=prewarm_features,
+                        has_speaker=prewarm_has_speaker,
+                        has_caption=prewarm_has_caption,
+                        graph_eligible=True,
+                        log_fn=_log,
                     )
-                    if self.model_cfg.use_caption_condition
-                    else None
-                )
-                encoded_conditions, _ = self._encode_and_predict_duration(
-                    text_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=None,
-                    speaker_mask_override=None,
-                    speaker_uncond_mode="mask",
-                    duration_features=prewarm_features,
-                    has_speaker=prewarm_has_speaker,
-                    has_caption=prewarm_has_caption,
-                    graph_eligible=True,
-                    log_fn=_log,
-                )
-            else:
-                encoded_conditions = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                )
-            for seq_len in lengths:
-                sample_euler_rf_cfg(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=int(seq_len),
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    num_steps=int(num_steps),
-                    cfg_scale_text=scale_text,
-                    cfg_scale_caption=scale_caption,
-                    cfg_scale_speaker=scale_speaker,
-                    cfg_guidance_mode=str(cfg_guidance_mode),
-                    cfg_min_t=float(cfg_min_t),
-                    cfg_max_t=float(cfg_max_t),
-                    seed=0,
-                    use_context_kv_cache=bool(context_kv_cache),
-                    t_schedule_mode=str(t_schedule_mode),
-                    sway_coeff=float(sway_coeff),
-                    cuda_graph_cache=self._cuda_graph_cache,
-                    encoded_conditions=encoded_conditions,
-                )
-                _log(f"[runtime] prewarm: captured graph for {seq_len} patched steps")
-                if self._cuda_graph_cache.get("__disabled__", False):
-                    return "prewarm aborted: CUDA graph capture failed; running in eager mode."
+                else:
+                    encoded_conditions = self.model.encode_conditions(
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                    )
+                for seq_len in lengths:
+                    sample_euler_rf_cfg(
+                        model=self.model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=int(seq_len),
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        num_steps=int(num_steps),
+                        cfg_scale_text=scale_text,
+                        cfg_scale_caption=scale_caption,
+                        cfg_scale_speaker=scale_speaker,
+                        cfg_guidance_mode=str(cfg_guidance_mode),
+                        cfg_min_t=float(cfg_min_t),
+                        cfg_max_t=float(cfg_max_t),
+                        seed=0,
+                        use_context_kv_cache=bool(context_kv_cache),
+                        t_schedule_mode=str(t_schedule_mode),
+                        sway_coeff=float(sway_coeff),
+                        cuda_graph_cache=self._cuda_graph_cache,
+                        encoded_conditions=encoded_conditions,
+                    )
+                    _log(
+                        f"[runtime] prewarm: captured graph for {seq_len} patched steps "
+                        f"(text {text_len})"
+                    )
+                    if self._cuda_graph_cache.get("__disabled__", False):
+                        return (
+                            "prewarm aborted: CUDA graph capture failed; running in eager mode."
+                        )
 
         # Release cached (non-graph) allocator blocks accumulated by the warmup
         # runs; graph private pools are owned by the graphs and stay intact.
@@ -1791,8 +1852,8 @@ class InferenceRuntime:
         graph_count = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
         lora_note = self._last_lora_token if self._last_lora_token is not None else "__base__"
         summary = (
-            f"prewarmed {len(lengths)} length buckets (<= {float(max_seconds):.1f}s) "
-            f"in {elapsed:.1f}s; graphs cached: {graph_count}\n"
+            f"prewarmed {len(lengths)} length buckets x {len(text_lengths)} text buckets "
+            f"(<= {float(max_seconds):.1f}s) in {elapsed:.1f}s; graphs cached: {graph_count}\n"
             f"lora: {lora_note}\n"
             "note: graphs are dropped if the LoRA Adapter Directory changes, "
             "unless LoRA Hot-Swap is enabled."
