@@ -273,6 +273,7 @@ class SamplingRequest:
     tail_mean_threshold: float = 0.1
     lora_adapter: str | None = None
     lora_hot_swap: bool = False
+    apply_watermark: bool = True
 
 
 @dataclass
@@ -1363,7 +1364,11 @@ class InferenceRuntime:
             stage_timings.append(("decode_latent", stage_sec))
             _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
-            if self.watermarker.ready:
+            if not bool(req.apply_watermark):
+                msg = "info: SilentCipher watermark disabled by request."
+                messages.append(msg)
+                _log(msg)
+            elif self.watermarker.ready:
                 t0 = _measure_start(self.codec_device)
                 trimmed_audios = self.watermarker.encode_batch(
                     trimmed_audios,

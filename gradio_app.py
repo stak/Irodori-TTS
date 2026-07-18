@@ -156,7 +156,13 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     if suffix in {".pt", ".safetensors"}:
         return checkpoint
 
-    resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
+    try:
+        # Prefer the local HF cache to avoid a network round-trip on every click.
+        resolved = hf_hub_download(
+            repo_id=checkpoint, filename="model.safetensors", local_files_only=True
+        )
+    except Exception:
+        resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
     print(f"[gradio] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
     return str(resolved)
 
@@ -242,6 +248,7 @@ def _run_generation(
     speaker_kv_max_layers_raw: str,
     lora_adapter_raw: str,
     lora_hot_swap: bool,
+    apply_watermark: bool,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -344,6 +351,7 @@ def _run_generation(
             trim_tail=True,
             lora_adapter=lora_adapter,
             lora_hot_swap=bool(lora_hot_swap),
+            apply_watermark=bool(apply_watermark),
         ),
         log_fn=stdout_log,
     )
@@ -603,6 +611,11 @@ def build_ui() -> gr.Blocks:
                     "adapter switches. Tiny fp rounding drift can accumulate per swap."
                 ),
             )
+            apply_watermark = gr.Checkbox(
+                label="SilentCipher Watermark",
+                value=True,
+                info="Embed an inaudible AI-generation watermark (~15 ms).",
+            )
 
         generate_btn = gr.Button("Generate", variant="primary")
 
@@ -663,6 +676,7 @@ def build_ui() -> gr.Blocks:
                 speaker_kv_max_layers_raw,
                 lora_adapter_raw,
                 lora_hot_swap,
+                apply_watermark,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
