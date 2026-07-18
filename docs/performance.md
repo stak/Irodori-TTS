@@ -20,6 +20,7 @@ All optimizations are inference-only. Training code paths are untouched.
 | TF32 tensor-core matmul for fp32 | CUDA (Ampere+) | ~41 dB SNR vs upstream (inaudible) | `IRODORI_DISABLE_TF32=1` |
 | LoRA adapter merged into base weights per request | all | fp rounding only | `IRODORI_DISABLE_LORA_MERGE=1` |
 | CUDA per-step graph replay of the sampling loop | CUDA only | exact vs eager; see bucketing note | `IRODORI_DISABLE_CUDA_GRAPH=1` |
+| CUDA graph replay of condition encoding + duration prediction | CUDA only | exact (bit-identical vs eager) | `IRODORI_DISABLE_DURATION_GRAPH=1` |
 | Latent-length bucketing (graphs shared across lengths) | CUDA only | ~47 dB SNR when padding occurs (inaudible, deterministic) | `IRODORI_CUDA_GRAPH_BUCKET=1` |
 | Graph prewarm (runtime API + Gradio button) | CUDA only | - | (button; opt-in) |
 | LoRA hot-swap keeping cached graphs | CUDA only | tiny fp drift per swap | (checkbox; default off) |
@@ -54,6 +55,7 @@ available for CUDA). CUDA graph replay removes that overhead.
 | `IRODORI_DISABLE_TF32` | `0` | `1` disables TF32 matmul (exact fp32, slower) |
 | `IRODORI_DISABLE_LORA_MERGE` | `0` | `1` keeps LoRA adapters unmerged (upstream behavior) |
 | `IRODORI_DISABLE_CUDA_GRAPH` | `0` | `1` disables graph capture/replay entirely |
+| `IRODORI_DISABLE_DURATION_GRAPH` | `0` | `1` keeps condition encoding + duration prediction eager (sampler graphs unaffected) |
 | `IRODORI_CUDA_GRAPH_BUCKET` | `16` | Latent-length bucket size in patched steps; `1` disables padding |
 | `IRODORI_CUDA_GRAPH_CACHE` | `64` | Max cached graph entries (per-entry VRAM is small; pool and condition buffers are shared) |
 
@@ -77,6 +79,16 @@ Notes:
   freely without re-capture. Changing `CFG Scale Text/Speaker` values,
   `Num Candidates`, precision/device, or supplying reference audio triggers a
   fresh capture per length bucket (one-time, ~1 s each).
+- The `predict_duration` stage (condition encoding + duration head) is also
+  replayed as one CUDA graph (~14 ms -> ~3-4 ms per request on the reference
+  setup). It is captured during Prewarm (or lazily on the first eligible
+  request, ~0.1 s one-time) and validated bit-exact against eager at capture.
+  Only fixed-shape requests take this path: reference-audio and
+  speaker-embedding requests, and non-default `max_text_len`, run the
+  unchanged eager code. Unlike the sampler graphs, this graph is dropped on
+  *every* LoRA switch — hot-swap explicitly permits
+  `modules_to_save=duration_predictor`, which replaces module storage the
+  duration graph captured — and recaptures on the next request.
 - Changing the LoRA Adapter Directory drops all cached graphs unless
   **LoRA Hot-Swap** is enabled. Hot-swap swaps adapter weights in place
   (unmerge old, merge new) so graphs survive; a tiny floating-point drift can

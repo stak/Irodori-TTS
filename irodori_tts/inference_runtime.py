@@ -29,7 +29,7 @@ from .lora import (
     load_lora_adapter,
 )
 from .model import TextToLatentRFDiT
-from .rf import sample_euler_rf_cfg
+from .rf import _get_warmup_stream, sample_euler_rf_cfg
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -711,6 +711,11 @@ class InferenceRuntime:
         resolved_path = self._resolve_lora_adapter_path(adapter_path)
         lora_token = resolved_path if resolved_path is not None else "__base__"
         if lora_token != self._last_lora_token:
+            # The duration/condition graph bakes in modules the sampler graphs
+            # never touch (duration_predictor, which hot-swap explicitly allows
+            # in modules_to_save), so it cannot survive any adapter switch.
+            # Recapture is cheap and happens on the next request/prewarm.
+            self._cuda_graph_cache.pop("__duration__", None)
             cached_graphs = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
             preserved = False
             if hot_swap and cached_graphs > 0:
@@ -962,6 +967,187 @@ class InferenceRuntime:
         )
         return state, mask
 
+    def _encode_and_predict_duration(
+        self,
+        *,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        caption_ids: torch.Tensor | None,
+        caption_mask: torch.Tensor | None,
+        speaker_state_override: torch.Tensor | None,
+        speaker_mask_override: torch.Tensor | None,
+        speaker_uncond_mode: str,
+        duration_features: torch.Tensor,
+        has_speaker: torch.Tensor,
+        has_caption: torch.Tensor | None,
+        graph_eligible: bool,
+        log_fn: Callable[[str], None],
+    ) -> tuple[tuple, torch.Tensor]:
+        """
+        Run encode_conditions + predict_duration_log_frames, replaying them as
+        a single CUDA graph when the request shape allows it.
+
+        The eager pair launches hundreds of tiny kernels, so on Windows (no
+        Triton/torch.compile) the stage is dominated by CPU launch overhead,
+        just like the sampling loop. Shapes are fixed for no-reference requests
+        (text padded to max_text_len, the no_ref speaker placeholder, aux
+        features), so one graph per (shape, batch) signature suffices.
+        Reference-audio requests have per-request shapes and stay eager.
+
+        Returns the encoded-conditions tuple and the predicted log-frames. On
+        the graph path these are the graph's static output tensors: they are
+        valid until the next call of this method and must be consumed within
+        the current request (synthesize holds the inference lock throughout).
+        """
+
+        def _run_eager() -> tuple[tuple, torch.Tensor]:
+            encoded = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_mode=speaker_uncond_mode,
+            )
+            pred = self.model.predict_duration_log_frames(
+                text_state=encoded[0],
+                text_mask=encoded[1],
+                speaker_state=encoded[2],
+                speaker_mask=encoded[3],
+                caption_state=encoded[4],
+                caption_mask=encoded[5],
+                duration_features=duration_features,
+                has_speaker=has_speaker,
+                has_caption=has_caption,
+            )
+            return encoded, pred
+
+        graph_supported = (
+            graph_eligible
+            and speaker_state_override is None
+            and self.model_device.type == "cuda"
+            and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
+            and os.environ.get("IRODORI_DISABLE_DURATION_GRAPH", "0").strip() != "1"
+            and not self._cuda_graph_cache.get("__duration_disabled__", False)
+        )
+        if not graph_supported:
+            return _run_eager()
+
+        request_inputs = [
+            text_ids,
+            text_mask,
+            ref_latent,
+            ref_mask,
+            caption_ids,
+            caption_mask,
+            duration_features,
+            has_speaker,
+            has_caption,
+        ]
+        presence = tuple(value is not None for value in request_inputs)
+        flat_inputs = [value for value in request_inputs if value is not None]
+        sig = (
+            presence,
+            tuple((tuple(t.shape), str(t.dtype)) for t in flat_inputs),
+            str(speaker_uncond_mode),
+        )
+        bundles = self._cuda_graph_cache.setdefault("__duration__", {})
+        entry = bundles.get(sig)
+        if entry is not None:
+            for static_buf, value in zip(entry["inputs"], flat_inputs, strict=True):
+                static_buf.copy_(value)
+            entry["graph"].replay()
+            return entry["encoded"], entry["pred"]
+
+        static_inputs = [value.clone() for value in flat_inputs]
+        buffer_iter = iter(static_inputs)
+        (
+            s_text_ids,
+            s_text_mask,
+            s_ref_latent,
+            s_ref_mask,
+            s_caption_ids,
+            s_caption_mask,
+            s_features,
+            s_has_speaker,
+            s_has_caption,
+        ) = [next(buffer_iter) if flag else None for flag in presence]
+
+        def _forward() -> tuple[tuple, torch.Tensor]:
+            encoded = self.model.encode_conditions(
+                text_input_ids=s_text_ids,
+                text_mask=s_text_mask,
+                ref_latent=s_ref_latent,
+                ref_mask=s_ref_mask,
+                caption_input_ids=s_caption_ids,
+                caption_mask=s_caption_mask,
+                speaker_state_override=None,
+                speaker_mask_override=None,
+                speaker_uncond_mode=speaker_uncond_mode,
+            )
+            pred = self.model.predict_duration_log_frames(
+                text_state=encoded[0],
+                text_mask=encoded[1],
+                speaker_state=encoded[2],
+                speaker_mask=encoded[3],
+                caption_state=encoded[4],
+                caption_mask=encoded[5],
+                duration_features=s_features,
+                has_speaker=s_has_speaker,
+                has_caption=s_has_caption,
+            )
+            return encoded, pred
+
+        try:
+            # Warmup on the shared side stream initializes cuBLAS/cuDNN and
+            # produces reference outputs the captured replay is checked against.
+            warm_stream = _get_warmup_stream()
+            warm_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm_stream):
+                warm_encoded, warm_pred = _forward()
+                warm_flat = [t.clone() for t in [*warm_encoded, warm_pred] if t is not None]
+            torch.cuda.current_stream().wait_stream(warm_stream)
+            torch.cuda.synchronize(self.model_device)
+
+            pool = self._cuda_graph_cache.get("__pool__")
+            if pool is None:
+                pool = torch.cuda.graph_pool_handle()
+                self._cuda_graph_cache["__pool__"] = pool
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                out_encoded, out_pred = _forward()
+
+            # Validate one replay against the eager warmup outputs.
+            graph.replay()
+            torch.cuda.synchronize(self.model_device)
+            out_flat = [t for t in [*out_encoded, out_pred] if t is not None]
+            if len(out_flat) != len(warm_flat) or not all(
+                torch.equal(out, warm) for out, warm in zip(out_flat, warm_flat, strict=True)
+            ):
+                raise RuntimeError(
+                    "duration CUDA graph replay mismatch against eager warmup output."
+                )
+        except Exception as exc:
+            self._cuda_graph_cache["__duration_disabled__"] = True
+            log_fn(f"[runtime] duration CUDA graph disabled: {exc!r}")
+            return _run_eager()
+
+        bundles[sig] = {
+            "graph": graph,
+            "inputs": static_inputs,
+            "encoded": out_encoded,
+            "pred": out_pred,
+        }
+        log_fn(
+            f"[runtime] captured duration/condition CUDA graph (entries: {len(bundles)})"
+        )
+        return out_encoded, out_pred
+
     def synthesize(
         self,
         req: SamplingRequest,
@@ -1202,42 +1388,33 @@ class InferenceRuntime:
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
                 ).to(self.model_device)
-                encoded_conditions = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                )
-                (
-                    duration_text_state,
-                    duration_text_mask,
-                    duration_speaker_state,
-                    _duration_speaker_mask,
-                    _duration_caption_state,
-                    _duration_caption_mask,
-                ) = encoded_conditions
-                pred_log_frames = self.model.predict_duration_log_frames(
-                    text_state=duration_text_state,
-                    text_mask=duration_text_mask,
-                    speaker_state=duration_speaker_state,
-                    speaker_mask=_duration_speaker_mask,
-                    caption_state=_duration_caption_state,
-                    caption_mask=_duration_caption_mask,
-                    duration_features=duration_features,
-                    has_speaker=has_speaker_duration,
-                    has_caption=torch.full(
+                has_caption_duration = (
+                    torch.full(
                         (num_candidates,),
                         has_caption_text,
                         dtype=torch.bool,
                         device=self.model_device,
                     )
                     if self.model_cfg.use_caption_condition
-                    else None,
+                    else None
+                )
+                # Reference-audio requests have per-request conditioning shapes;
+                # only fixed-shape (no-reference) requests take the graph path.
+                encoded_conditions, pred_log_frames = self._encode_and_predict_duration(
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=req.speaker_uncond_mode,
+                    duration_features=duration_features,
+                    has_speaker=has_speaker_duration,
+                    has_caption=has_caption_duration,
+                    graph_eligible=bool(req.no_ref) or ref_latent is None,
+                    log_fn=_log,
                 )
                 pred_frames = torch.expm1(pred_log_frames).float().mean().item()
                 scaled_frames = pred_frames * duration_scale
@@ -1501,14 +1678,53 @@ class InferenceRuntime:
                 use_caption_condition=False,
                 use_speaker_condition=False,
             )
-            encoded_conditions = self.model.encode_conditions(
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                caption_input_ids=caption_ids,
-                caption_mask=caption_mask,
-            )
+            if self.model_cfg.use_duration_predictor:
+                # Capture the duration/condition graph too, so the first real
+                # request skips its one-time capture cost. Shapes (not values)
+                # key the graph, so the placeholder text is irrelevant.
+                prewarm_has_speaker = torch.zeros(
+                    (int(num_candidates),), dtype=torch.bool, device=self.model_device
+                )
+                if ref_mask is not None:
+                    prewarm_has_speaker = ref_mask.any(dim=1)
+                prewarm_features = build_duration_features(
+                    ["こんにちは。"] * int(num_candidates),
+                    token_counts=text_mask.sum(dim=1),
+                    max_text_len=self.default_text_max_len,
+                    has_speaker=prewarm_has_speaker,
+                ).to(self.model_device)
+                prewarm_has_caption = (
+                    torch.zeros(
+                        (int(num_candidates),), dtype=torch.bool, device=self.model_device
+                    )
+                    if self.model_cfg.use_caption_condition
+                    else None
+                )
+                encoded_conditions, _ = self._encode_and_predict_duration(
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=None,
+                    speaker_mask_override=None,
+                    speaker_uncond_mode="mask",
+                    duration_features=prewarm_features,
+                    has_speaker=prewarm_has_speaker,
+                    has_caption=prewarm_has_caption,
+                    graph_eligible=True,
+                    log_fn=_log,
+                )
+            else:
+                encoded_conditions = self.model.encode_conditions(
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                )
             for seq_len in lengths:
                 sample_euler_rf_cfg(
                     model=self.model,

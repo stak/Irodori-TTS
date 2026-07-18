@@ -447,6 +447,17 @@ def _safe_attention_mask(
         )
     mask = mask.to(device=x.device, dtype=torch.bool)
     has_any = mask.any(dim=1)
+    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+        # bool(has_any.all()) requires a GPU->CPU sync, which is illegal while
+        # a CUDA graph is being captured. Apply the empty-row fix branchlessly
+        # instead; when every row has a valid position (the usual case) the
+        # result is value-identical to the early-return path.
+        if x.shape[1] <= 0:
+            raise ValueError("Cannot attention-pool an empty sequence.")
+        x = torch.where(has_any[:, None, None], x, torch.zeros((), device=x.device, dtype=x.dtype))
+        mask = mask.clone()
+        mask[:, 0] = mask[:, 0] | ~has_any
+        return x, mask
     if bool(has_any.all()):
         return x, mask
     if x.shape[1] <= 0:
