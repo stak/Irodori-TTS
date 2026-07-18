@@ -1060,8 +1060,8 @@ class InferenceRuntime:
         The eager pair launches hundreds of tiny kernels, so on Windows (no
         Triton/torch.compile) the stage is dominated by CPU launch overhead,
         just like the sampling loop. Shapes are fixed for no-reference requests
-        (text padded to max_text_len, the no_ref speaker placeholder, aux
-        features), so one graph per (shape, batch) signature suffices.
+        (text padded to its bucket length or max_text_len, the no_ref speaker
+        placeholder, aux features), so one graph per shape signature suffices.
         Reference-audio requests have per-request shapes and stay eager.
 
         Returns the encoded-conditions tuple and the predicted log-frames. On

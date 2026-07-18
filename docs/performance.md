@@ -1,11 +1,15 @@
 # Inference Performance Fork Notes
 
 This fork adds a set of inference-speed optimizations on top of upstream
-Irodori-TTS. On the reference setup (RTX 40-series, Windows, fp32, 40 steps,
-~4 s utterance, LoRA adapter, watermark enabled, locked GPU clocks),
-steady-state `total_to_decode` in the Gradio app drops from **~1.0 s to
-~0.24 s**. Without locked clocks, GPU power management adds run-to-run
-variance (see [Latency variance](#latency-variance-gpu-clocks)).
+Irodori-TTS. On the reference setup (RTX 40-series, 40 steps, ~4 s utterance,
+LoRA adapter, watermark enabled, locked GPU clocks), steady-state
+`total_to_decode` in the Gradio app drops from **~1.0 s to ~0.25 s**
+(Windows-native, default fp32 settings). Opting into bf16 model precision
+brings it to **~0.20 s**, and additionally enabling torch.compile on
+Linux/WSL2 to **~0.14-0.15 s** (see [Precision Choice](#precision-choice) and
+[torch.compile](#torchcompile-linux--wsl2-opt-in)). Without locked clocks,
+GPU power management adds run-to-run variance (see
+[Latency variance](#latency-variance-gpu-clocks)).
 
 All optimizations are inference-only. Training code paths are untouched.
 
@@ -50,7 +54,9 @@ The headline speedup comes from **CUDA Graphs**, which assumes:
 The optimization targets the **launch-overhead-bound** regime: this model's
 per-step compute is small, so eager sampling time is dominated by CPU-side
 kernel launches (especially on Windows, where Triton/`torch.compile` is not
-available for CUDA). CUDA graph replay removes that overhead.
+available for CUDA). CUDA graph replay removes that overhead. On Linux/WSL2,
+torch.compile can additionally be layered on top of the graphs to shrink the
+kernels themselves (see [torch.compile](#torchcompile-linux--wsl2-opt-in)).
 
 ## Environment Variables
 
@@ -168,8 +174,11 @@ performance".
 
 ## Output Differences vs Upstream
 
-Same seed remains deterministic in all configurations. Numerical differences
-from upstream, all far below audibility:
+Same seed remains deterministic in all configurations. The default-on changes
+below cause numerical differences from upstream that are all far below
+audibility. (Opt-in bf16 model precision and `IRODORI_COMPILE` instead change
+the sampling trajectory outright — a different take of the same text — and
+are covered in their own sections above.)
 
 - **TF32 + LoRA merge**: measured ~41 dB SNR against upstream output for the
   same seed.
@@ -220,10 +229,13 @@ the DACVAE decoder is **GPU-compute-bound**, not launch-bound:
 
 - **One-shot CLI (`infer.py`) pays capture cost**: the graph path captures on
   the first request, which is pure overhead for a single-generation process
-  (~+0.5-1 s). Set `IRODORI_DISABLE_CUDA_GRAPH=1` for one-shot CLI runs.
-- **VRAM**: cached graphs add roughly 0.5-1 GiB after a 15 s prewarm
-  (shared memory pool + shared condition buffers + driver-side graph
-  executables). Upstream uses correspondingly less.
+  (~+0.5-1 s). Set `IRODORI_DISABLE_CUDA_GRAPH=1` for one-shot CLI runs, and
+  keep `IRODORI_COMPILE` off there (a cold compile adds minutes).
+- **VRAM**: cached graphs add roughly 1-1.5 GiB after a 15 s prewarm
+  (24 latent buckets x 2 text buckets; ~16 MiB of driver-side graph memory
+  per entry, plus the shared memory pool and per-text-bucket condition
+  buffers). `IRODORI_TEXT_BUCKETS=0` roughly halves this. Upstream uses
+  correspondingly less.
 - **Offline-first checkpoint resolution**: the Gradio app now resolves
   HF-hub checkpoints from the local cache first. If the upstream repo
   publishes a newer `model.safetensors`, it is **not** picked up
@@ -236,7 +248,8 @@ the DACVAE decoder is **GPU-compute-bound**, not launch-bound:
 - **Reference-audio requests and per-request `max_text_len` overrides**
   produce different conditioning shapes per request, so they re-capture per
   shape instead of hitting prewarmed graphs (prewarm covers the
-  no-reference/LoRA path with the checkpoint's default text length).
+  no-reference/LoRA path at each configured text bucket length and the
+  checkpoint's default text length).
 - Upstream functionality is otherwise preserved. Configurations not eligible
   for the graph path (`joint`/`alternating` CFG, temporal rescale,
   speaker-KV scaling, non-CUDA devices) run through the unchanged eager
