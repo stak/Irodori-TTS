@@ -156,7 +156,13 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     if suffix in {".pt", ".safetensors"}:
         return checkpoint
 
-    resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
+    try:
+        # Prefer the local HF cache to avoid a network round-trip on every click.
+        resolved = hf_hub_download(
+            repo_id=checkpoint, filename="model.safetensors", local_files_only=True
+        )
+    except Exception:
+        resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
     print(f"[gradio] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
     return str(resolved)
 
@@ -241,6 +247,8 @@ def _run_generation(
     speaker_kv_min_t_raw: str,
     speaker_kv_max_layers_raw: str,
     lora_adapter_raw: str,
+    lora_hot_swap: bool,
+    apply_watermark: bool,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -342,6 +350,8 @@ def _run_generation(
             sway_coeff=float(sway_coeff),
             trim_tail=True,
             lora_adapter=lora_adapter,
+            lora_hot_swap=bool(lora_hot_swap),
+            apply_watermark=bool(apply_watermark),
         ),
         log_fn=stdout_log,
     )
@@ -382,6 +392,58 @@ def _run_generation(
 def _clear_runtime_cache() -> str:
     clear_cached_runtime()
     return "cleared loaded model from memory"
+
+
+def _prewarm_graphs(
+    checkpoint: str,
+    model_device: str,
+    model_precision: str,
+    codec_device: str,
+    codec_precision: str,
+    prewarm_seconds: float,
+    num_steps: int,
+    num_candidates: int,
+    t_schedule_mode: str,
+    sway_coeff: float,
+    cfg_guidance_mode: str,
+    cfg_scale_text: float,
+    cfg_scale_speaker: float,
+    cfg_scale_raw: str,
+    cfg_min_t: float,
+    cfg_max_t: float,
+    context_kv_cache: bool,
+    lora_adapter_raw: str,
+    lora_hot_swap: bool,
+) -> str:
+    runtime_key = _build_runtime_key(
+        checkpoint=checkpoint,
+        model_device=model_device,
+        model_precision=model_precision,
+        codec_device=codec_device,
+        codec_precision=codec_precision,
+    )
+    runtime, reloaded = get_cached_runtime(runtime_key)
+    cfg_scale = _parse_optional_float(cfg_scale_raw, "cfg_scale")
+    lora_adapter = _parse_optional_str(lora_adapter_raw)
+    status = runtime.prewarm_cuda_graphs(
+        lora_adapter=lora_adapter,
+        lora_hot_swap=bool(lora_hot_swap),
+        max_seconds=float(prewarm_seconds),
+        num_steps=int(num_steps),
+        num_candidates=int(num_candidates),
+        cfg_guidance_mode=str(cfg_guidance_mode),
+        cfg_scale_text=float(cfg_scale_text),
+        cfg_scale_speaker=float(cfg_scale_speaker),
+        cfg_scale=cfg_scale,
+        cfg_min_t=float(cfg_min_t),
+        cfg_max_t=float(cfg_max_t),
+        context_kv_cache=bool(context_kv_cache),
+        t_schedule_mode=str(t_schedule_mode),
+        sway_coeff=float(sway_coeff),
+        log_fn=lambda msg: print(msg, flush=True),
+    )
+    prefix = "runtime: reloaded\n" if reloaded else "runtime: reused\n"
+    return prefix + status
 
 
 def build_ui() -> gr.Blocks:
@@ -432,6 +494,13 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             load_model_btn = gr.Button("Load Model")
             clear_cache_btn = gr.Button("Unload Model")
+            prewarm_btn = gr.Button("Prewarm Graphs")
+            prewarm_seconds = gr.Number(
+                label="Prewarm Max Seconds",
+                value=15,
+                scale=0,
+                min_width=140,
+            )
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
         with gr.Column():
@@ -534,6 +603,19 @@ def build_ui() -> gr.Blocks:
                     label="Speaker KV Max Layers (optional)", value=""
                 )
             lora_adapter_raw = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
+            lora_hot_swap = gr.Checkbox(
+                label="LoRA Hot-Swap (keep prewarmed CUDA graphs)",
+                value=False,
+                info=(
+                    "Swap LoRA weights in place so cached/prewarmed CUDA graphs survive "
+                    "adapter switches. Tiny fp rounding drift can accumulate per swap."
+                ),
+            )
+            apply_watermark = gr.Checkbox(
+                label="SilentCipher Watermark",
+                value=True,
+                info="Embed an inaudible AI-generation watermark (~15 ms).",
+            )
 
         generate_btn = gr.Button("Generate", variant="primary")
 
@@ -593,6 +675,8 @@ def build_ui() -> gr.Blocks:
                 speaker_kv_min_t_raw,
                 speaker_kv_max_layers_raw,
                 lora_adapter_raw,
+                lora_hot_swap,
+                apply_watermark,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
@@ -618,6 +702,31 @@ def build_ui() -> gr.Blocks:
             outputs=[clear_cache_msg],
         )
         clear_cache_btn.click(_clear_runtime_cache, outputs=[clear_cache_msg])
+        prewarm_btn.click(
+            _prewarm_graphs,
+            inputs=[
+                checkpoint,
+                model_device,
+                model_precision,
+                codec_device,
+                codec_precision,
+                prewarm_seconds,
+                num_steps,
+                num_candidates,
+                t_schedule_mode,
+                sway_coeff,
+                cfg_guidance_mode,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_scale_raw,
+                cfg_min_t,
+                cfg_max_t,
+                context_kv_cache,
+                lora_adapter_raw,
+                lora_hot_swap,
+            ],
+            outputs=[clear_cache_msg],
+        )
 
     return demo
 
