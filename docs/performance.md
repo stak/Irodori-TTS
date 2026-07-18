@@ -70,6 +70,22 @@ Setting `IRODORI_DISABLE_TF32=1`, `IRODORI_DISABLE_LORA_MERGE=1`,
 **bit-identically** (the remaining optimizations are exact;
 `IRODORI_DISABLE_CUDA_GRAPH=1` also disables the duration graph).
 
+## Precision Choice
+
+- **Model Precision = bf16** is worth trying: sample_rf drops a further ~23%
+  (measured 216 -> 169 ms; total_to_decode ~242 -> ~196 ms on the reference
+  setup) and same-seed outputs remain bit-reproducible. Unlike the SNR-graded
+  changes above, bf16 sampling follows a *different trajectory* — outputs are
+  effectively a different take of the same text (predicted duration can shift
+  by a frame), so judge it by ear, not SNR. LoRA merge rounding also lands in
+  bf16. Keep fp32 when exact fp32 fidelity or fp32-tagged reproducibility
+  matters.
+- **Codec Precision should stay fp32**: with the default fp16 decode path the
+  decoder already runs at half precision speed (~10 ms) with ~60 dB SNR and
+  an fp32 encoder. Selecting bf16/fp16 codec precision is not faster and only
+  lowers quality (bf16 decode measured ~42 dB), and it additionally moves the
+  reference-audio *encoder* off fp32.
+
 ## Recommended Gradio Workflow
 
 1. Load Model.
