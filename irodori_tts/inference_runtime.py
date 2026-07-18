@@ -29,7 +29,11 @@ from .lora import (
     load_lora_adapter,
 )
 from .model import TextToLatentRFDiT
-from .rf import sample_euler_rf_cfg
+from .rf import (
+    _end_pool_recording_after_failed_capture,
+    _get_warmup_stream,
+    sample_euler_rf_cfg,
+)
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -119,12 +123,40 @@ def _enable_cuda_fast_math() -> None:
     # TF32 for matmuls only. Empirically, forcing TF32/cudnn-benchmark on the
     # codec's convolutional decoder can select much slower conv algorithms, so
     # convolutions are left at default fp32 behavior.
+    #
+    # Use the legacy allow_tf32 flag rather than the >=2.9 fp32_precision API:
+    # torch 2.10 raises on mixing the two, and inductor's pad_mm pass still
+    # READS the legacy flag for fp32 matmuls, so setting the new API breaks
+    # torch.compile of fp32 models ("mix of the legacy and new APIs" error).
+    # Fall back to the new API if a future release removes the legacy setter.
     try:
-        # PyTorch >= 2.9 fp32 precision API.
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-    except Exception:
         torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
     _FAST_MATH_CONFIGURED = True
+
+
+def _text_bucket_lengths() -> list[int]:
+    """
+    Text-length buckets (in tokens). Short texts are padded to the smallest
+    bucket that fits instead of the checkpoint's full max_text_len, shrinking
+    the per-step cross-attention over masked padding keys. Comma-separated in
+    IRODORI_TEXT_BUCKETS; empty or "0" disables bucketing (always pad to
+    max_text_len, the upstream behavior).
+    """
+    raw = os.environ.get("IRODORI_TEXT_BUCKETS", "64").strip()
+    if raw in {"", "0"}:
+        return []
+    lengths = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = int(part)
+        if value <= 0:
+            raise ValueError(f"IRODORI_TEXT_BUCKETS entries must be > 0, got {part!r}")
+        lengths.append(value)
+    return sorted(set(lengths))
 
 
 def _sync_device(device: torch.device) -> None:
@@ -293,17 +325,28 @@ def _maybe_compile_inference_model(
     enabled: bool,
     dynamic: bool,
 ) -> TextToLatentRFDiT:
+    # IRODORI_COMPILE=1 opts into torch.compile without changing the runtime
+    # key (requires a working Triton toolchain: Linux/WSL2 + a C compiler).
+    # Compiled kernels are replayed inside the CUDA step graphs, combining
+    # inductor's kernel fusion with graph replay's zero launch overhead.
+    if os.environ.get("IRODORI_COMPILE", "0").strip() == "1":
+        enabled = True
     if not enabled:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("compile_model=True requires torch.compile (PyTorch 2+).")
-    compile_kwargs = {"dynamic": bool(dynamic)}
+    # dynamic=None (auto) compiles the first-seen shape statically and switches
+    # to dynamic-shape kernels on the second, so the many latent-length buckets
+    # do not each pay a full compile.
+    compile_kwargs = {"dynamic": True if dynamic else None}
     model.encode_conditions = torch.compile(model.encode_conditions, **compile_kwargs)
     model.build_context_kv_cache = torch.compile(model.build_context_kv_cache, **compile_kwargs)
     model.forward_with_encoded_conditions = torch.compile(
         model.forward_with_encoded_conditions,
         **compile_kwargs,
     )
+    model._irodori_compiled = True
+    print("[runtime] torch.compile enabled for inference model", flush=True)
     return model
 
 
@@ -610,6 +653,26 @@ class InferenceRuntime:
                 "Use a compatible codec/checkpoint pair."
             )
 
+        # Build the lazily-grown RoPE caches now (normal mode, before any
+        # compile or CUDA graph capture) so they never rebuild inside compiled
+        # or captured code. Sized to the default max_seconds bound (30 s);
+        # longer manual requests just rebuild lazily as before.
+        hop_length = int(codec.model.hop_length)
+        max_frames = max(1, math.ceil(30.0 * codec.sample_rate / hop_length))
+        graph_bucket = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_BUCKET", "16")))
+        max_patched = math.ceil(max_frames / model_cfg.latent_patch_size)
+        max_padded = ((max_patched + graph_bucket - 1) // graph_bucket) * graph_bucket
+        speaker_len = None
+        if model_cfg.use_speaker_condition_resolved:
+            speaker_len = (
+                math.ceil(max_frames / max(1, int(model_cfg.speaker_patch_size))) + 1
+            )
+        model.prewarm_rope_caches(
+            text_len=default_text_max_len,
+            latent_len=max_padded,
+            speaker_len=speaker_len,
+        )
+
         return cls(
             key=key,
             model_cfg=model_cfg,
@@ -711,6 +774,11 @@ class InferenceRuntime:
         resolved_path = self._resolve_lora_adapter_path(adapter_path)
         lora_token = resolved_path if resolved_path is not None else "__base__"
         if lora_token != self._last_lora_token:
+            # The duration/condition graph bakes in modules the sampler graphs
+            # never touch (duration_predictor, which hot-swap explicitly allows
+            # in modules_to_save), so it cannot survive any adapter switch.
+            # Recapture is cheap and happens on the next request/prewarm.
+            self._cuda_graph_cache.pop("__duration__", None)
             cached_graphs = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
             preserved = False
             if hot_swap and cached_graphs > 0:
@@ -751,8 +819,13 @@ class InferenceRuntime:
                 return disable_adapter()
             return nullcontext()
 
-        if self.key.compile_model:
-            raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+        if getattr(self.model, "_irodori_compiled", False):
+            msg = (
+                "info: torch.compile is active; the LoRA structure change triggers a "
+                "one-time recompile during the next warmup (prewarm absorbs it)."
+            )
+            messages.append(msg)
+            log_fn(msg)
 
         if self._merged_lora_path == resolved_path:
             msg = f"info: using merged LoRA adapter (cached): {resolved_path}"
@@ -962,6 +1035,190 @@ class InferenceRuntime:
         )
         return state, mask
 
+    def _encode_and_predict_duration(
+        self,
+        *,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        caption_ids: torch.Tensor | None,
+        caption_mask: torch.Tensor | None,
+        speaker_state_override: torch.Tensor | None,
+        speaker_mask_override: torch.Tensor | None,
+        speaker_uncond_mode: str,
+        duration_features: torch.Tensor,
+        has_speaker: torch.Tensor,
+        has_caption: torch.Tensor | None,
+        graph_eligible: bool,
+        log_fn: Callable[[str], None],
+    ) -> tuple[tuple, torch.Tensor]:
+        """
+        Run encode_conditions + predict_duration_log_frames, replaying them as
+        a single CUDA graph when the request shape allows it.
+
+        The eager pair launches hundreds of tiny kernels, so on Windows (no
+        Triton/torch.compile) the stage is dominated by CPU launch overhead,
+        just like the sampling loop. Shapes are fixed for no-reference requests
+        (text padded to its bucket length or max_text_len, the no_ref speaker
+        placeholder, aux features), so one graph per shape signature suffices.
+        Reference-audio requests have per-request shapes and stay eager.
+
+        Returns the encoded-conditions tuple and the predicted log-frames. On
+        the graph path these are the graph's static output tensors: they are
+        valid until the next call of this method and must be consumed within
+        the current request (synthesize holds the inference lock throughout).
+        """
+
+        def _run_eager() -> tuple[tuple, torch.Tensor]:
+            encoded = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_mode=speaker_uncond_mode,
+            )
+            pred = self.model.predict_duration_log_frames(
+                text_state=encoded[0],
+                text_mask=encoded[1],
+                speaker_state=encoded[2],
+                speaker_mask=encoded[3],
+                caption_state=encoded[4],
+                caption_mask=encoded[5],
+                duration_features=duration_features,
+                has_speaker=has_speaker,
+                has_caption=has_caption,
+            )
+            return encoded, pred
+
+        graph_supported = (
+            graph_eligible
+            and speaker_state_override is None
+            and self.model_device.type == "cuda"
+            and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
+            and os.environ.get("IRODORI_DISABLE_DURATION_GRAPH", "0").strip() != "1"
+            and not self._cuda_graph_cache.get("__duration_disabled__", False)
+        )
+        if not graph_supported:
+            return _run_eager()
+
+        request_inputs = [
+            text_ids,
+            text_mask,
+            ref_latent,
+            ref_mask,
+            caption_ids,
+            caption_mask,
+            duration_features,
+            has_speaker,
+            has_caption,
+        ]
+        presence = tuple(value is not None for value in request_inputs)
+        flat_inputs = [value for value in request_inputs if value is not None]
+        sig = (
+            presence,
+            tuple((tuple(t.shape), str(t.dtype)) for t in flat_inputs),
+            str(speaker_uncond_mode),
+        )
+        bundles = self._cuda_graph_cache.setdefault("__duration__", {})
+        entry = bundles.get(sig)
+        if entry is not None:
+            for static_buf, value in zip(entry["inputs"], flat_inputs, strict=True):
+                static_buf.copy_(value)
+            entry["graph"].replay()
+            return entry["encoded"], entry["pred"]
+
+        static_inputs = [value.clone() for value in flat_inputs]
+        buffer_iter = iter(static_inputs)
+        (
+            s_text_ids,
+            s_text_mask,
+            s_ref_latent,
+            s_ref_mask,
+            s_caption_ids,
+            s_caption_mask,
+            s_features,
+            s_has_speaker,
+            s_has_caption,
+        ) = [next(buffer_iter) if flag else None for flag in presence]
+
+        def _forward() -> tuple[tuple, torch.Tensor]:
+            encoded = self.model.encode_conditions(
+                text_input_ids=s_text_ids,
+                text_mask=s_text_mask,
+                ref_latent=s_ref_latent,
+                ref_mask=s_ref_mask,
+                caption_input_ids=s_caption_ids,
+                caption_mask=s_caption_mask,
+                speaker_state_override=None,
+                speaker_mask_override=None,
+                speaker_uncond_mode=speaker_uncond_mode,
+            )
+            pred = self.model.predict_duration_log_frames(
+                text_state=encoded[0],
+                text_mask=encoded[1],
+                speaker_state=encoded[2],
+                speaker_mask=encoded[3],
+                caption_state=encoded[4],
+                caption_mask=encoded[5],
+                duration_features=s_features,
+                has_speaker=s_has_speaker,
+                has_caption=s_has_caption,
+            )
+            return encoded, pred
+
+        try:
+            # Warmup on the shared side stream initializes cuBLAS/cuDNN and
+            # produces reference outputs the captured replay is checked against.
+            warm_stream = _get_warmup_stream()
+            warm_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm_stream):
+                warm_encoded, warm_pred = _forward()
+                warm_flat = [t.clone() for t in [*warm_encoded, warm_pred] if t is not None]
+            torch.cuda.current_stream().wait_stream(warm_stream)
+            torch.cuda.synchronize(self.model_device)
+
+            pool = self._cuda_graph_cache.get("__pool__")
+            if pool is None:
+                pool = torch.cuda.graph_pool_handle()
+                self._cuda_graph_cache["__pool__"] = pool
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                out_encoded, out_pred = _forward()
+
+            # Validate one replay against the eager warmup outputs.
+            graph.replay()
+            torch.cuda.synchronize(self.model_device)
+            out_flat = [t for t in [*out_encoded, out_pred] if t is not None]
+            if len(out_flat) != len(warm_flat) or not all(
+                torch.equal(out, warm) for out, warm in zip(out_flat, warm_flat, strict=True)
+            ):
+                raise RuntimeError(
+                    "duration CUDA graph replay mismatch against eager warmup output."
+                )
+        except Exception as exc:
+            self._cuda_graph_cache["__duration_disabled__"] = True
+            _end_pool_recording_after_failed_capture(
+                self.model_device, self._cuda_graph_cache.get("__pool__")
+            )
+            log_fn(f"[runtime] duration CUDA graph disabled: {exc!r}")
+            return _run_eager()
+
+        bundles[sig] = {
+            "graph": graph,
+            "inputs": static_inputs,
+            "encoded": out_encoded,
+            "pred": out_pred,
+        }
+        log_fn(
+            f"[runtime] captured duration/condition CUDA graph (entries: {len(bundles)})"
+        )
+        return out_encoded, out_pred
+
     def synthesize(
         self,
         req: SamplingRequest,
@@ -1125,6 +1382,22 @@ class InferenceRuntime:
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
+            # Text-length bucketing: pad short texts to the smallest bucket
+            # instead of the full max_text_len. Masked padding keys are
+            # mathematically inert but still cost cross-attention compute
+            # every step. Tokenization is right-padded, so slicing the padded
+            # batch equals re-encoding at the bucket length. Note that
+            # duration features keep the original max_text_len normalization
+            # (text_max_len below is unchanged), so predicted durations are
+            # unaffected by the bucket choice. Explicit max_text_len requests
+            # bypass bucketing.
+            if req.max_text_len is None:
+                token_count = int(text_mask.sum(dim=1).max())
+                for bucket_len in _text_bucket_lengths():
+                    if token_count <= bucket_len < text_ids.shape[1]:
+                        text_ids = text_ids[:, :bucket_len].contiguous()
+                        text_mask = text_mask[:, :bucket_len].contiguous()
+                        break
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
@@ -1202,42 +1475,33 @@ class InferenceRuntime:
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
                 ).to(self.model_device)
-                encoded_conditions = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                )
-                (
-                    duration_text_state,
-                    duration_text_mask,
-                    duration_speaker_state,
-                    _duration_speaker_mask,
-                    _duration_caption_state,
-                    _duration_caption_mask,
-                ) = encoded_conditions
-                pred_log_frames = self.model.predict_duration_log_frames(
-                    text_state=duration_text_state,
-                    text_mask=duration_text_mask,
-                    speaker_state=duration_speaker_state,
-                    speaker_mask=_duration_speaker_mask,
-                    caption_state=_duration_caption_state,
-                    caption_mask=_duration_caption_mask,
-                    duration_features=duration_features,
-                    has_speaker=has_speaker_duration,
-                    has_caption=torch.full(
+                has_caption_duration = (
+                    torch.full(
                         (num_candidates,),
                         has_caption_text,
                         dtype=torch.bool,
                         device=self.model_device,
                     )
                     if self.model_cfg.use_caption_condition
-                    else None,
+                    else None
+                )
+                # Reference-audio requests have per-request conditioning shapes;
+                # only fixed-shape (no-reference) requests take the graph path.
+                encoded_conditions, pred_log_frames = self._encode_and_predict_duration(
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=req.speaker_uncond_mode,
+                    duration_features=duration_features,
+                    has_speaker=has_speaker_duration,
+                    has_caption=has_caption_duration,
+                    graph_eligible=bool(req.no_ref) or ref_latent is None,
+                    log_fn=_log,
                 )
                 pred_frames = torch.expm1(pred_log_frames).float().mean().item()
                 scaled_frames = pred_frames * duration_scale
@@ -1445,13 +1709,28 @@ class InferenceRuntime:
         max_patched = math.ceil(max_frames / self.model_cfg.latent_patch_size)
         max_padded = ((max_patched + bucket - 1) // bucket) * bucket
         lengths = list(range(bucket, max_padded + 1, bucket))
+        # One sampler-graph entry is captured per (text bucket, latent bucket)
+        # pair; the largest text length (max_text_len, i.e. no bucketing) is
+        # always covered so long texts stay on the fast path.
+        text_lengths = sorted(
+            {
+                int(self.default_text_max_len),
+                *[
+                    b
+                    for b in _text_bucket_lengths()
+                    if b < int(self.default_text_max_len)
+                ],
+            },
+            reverse=True,
+        )
         max_entries = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_CACHE", "64")))
-        if len(lengths) > max_entries:
+        per_text_budget = max(1, max_entries // len(text_lengths))
+        if len(lengths) > per_text_budget:
             # Keep the shortest buckets: short utterances are by far the most
             # common, so they must stay covered when the cache cannot hold all.
-            lengths = lengths[:max_entries]
+            lengths = lengths[:per_text_budget]
             messages.append(
-                f"warning: prewarm truncated to {max_entries} buckets "
+                f"warning: prewarm truncated to {per_text_budget} latent buckets per text bucket "
                 f"(covers up to {lengths[-1] * self.model_cfg.latent_patch_size * hop_length / self.codec.sample_rate:.1f}s); "
                 "raise IRODORI_CUDA_GRAPH_CACHE or IRODORI_CUDA_GRAPH_BUCKET to cover more."
             )
@@ -1471,12 +1750,10 @@ class InferenceRuntime:
             ),
             torch.inference_mode(),
         ):
-            text_ids, text_mask = self.tokenizer.batch_encode(
+            text_ids_full, text_mask_full = self.tokenizer.batch_encode(
                 ["こんにちは。"] * int(num_candidates),
                 max_length=self.default_text_max_len,
             )
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
             caption_ids = None
             caption_mask = None
             if self.model_cfg.use_caption_condition and self.caption_tokenizer is not None:
@@ -1501,53 +1778,130 @@ class InferenceRuntime:
                 use_caption_condition=False,
                 use_speaker_condition=False,
             )
-            encoded_conditions = self.model.encode_conditions(
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                caption_input_ids=caption_ids,
-                caption_mask=caption_mask,
+            prewarm_has_speaker = torch.zeros(
+                (int(num_candidates),), dtype=torch.bool, device=self.model_device
             )
-            for seq_len in lengths:
-                sample_euler_rf_cfg(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=int(seq_len),
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    num_steps=int(num_steps),
-                    cfg_scale_text=scale_text,
-                    cfg_scale_caption=scale_caption,
-                    cfg_scale_speaker=scale_speaker,
-                    cfg_guidance_mode=str(cfg_guidance_mode),
-                    cfg_min_t=float(cfg_min_t),
-                    cfg_max_t=float(cfg_max_t),
-                    seed=0,
-                    use_context_kv_cache=bool(context_kv_cache),
-                    t_schedule_mode=str(t_schedule_mode),
-                    sway_coeff=float(sway_coeff),
-                    cuda_graph_cache=self._cuda_graph_cache,
-                    encoded_conditions=encoded_conditions,
-                )
-                _log(f"[runtime] prewarm: captured graph for {seq_len} patched steps")
-                if self._cuda_graph_cache.get("__disabled__", False):
-                    return "prewarm aborted: CUDA graph capture failed; running in eager mode."
+            if ref_mask is not None:
+                prewarm_has_speaker = ref_mask.any(dim=1)
+            prewarm_features = build_duration_features(
+                ["こんにちは。"] * int(num_candidates),
+                token_counts=text_mask_full.sum(dim=1),
+                max_text_len=self.default_text_max_len,
+                has_speaker=prewarm_has_speaker,
+            ).to(self.model_device)
+            prewarm_has_caption = (
+                torch.zeros((int(num_candidates),), dtype=torch.bool, device=self.model_device)
+                if self.model_cfg.use_caption_condition
+                else None
+            )
+            for text_len in text_lengths:
+                # Tokenization is right-padded, so slicing the full-length
+                # batch equals re-encoding at the bucket length.
+                text_ids = text_ids_full[:, :text_len].contiguous().to(self.model_device)
+                text_mask = text_mask_full[:, :text_len].contiguous().to(self.model_device)
+                if self.model_cfg.use_duration_predictor:
+                    # Capture the duration/condition graph too, so the first
+                    # real request skips its one-time capture cost. Shapes
+                    # (not values) key the graph, so the placeholder text is
+                    # irrelevant.
+                    encoded_conditions, _ = self._encode_and_predict_duration(
+                        text_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        caption_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        speaker_state_override=None,
+                        speaker_mask_override=None,
+                        speaker_uncond_mode="mask",
+                        duration_features=prewarm_features,
+                        has_speaker=prewarm_has_speaker,
+                        has_caption=prewarm_has_caption,
+                        graph_eligible=True,
+                        log_fn=_log,
+                    )
+                else:
+                    encoded_conditions = self.model.encode_conditions(
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                    )
+                for seq_len in lengths:
+                    sample_euler_rf_cfg(
+                        model=self.model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=int(seq_len),
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        num_steps=int(num_steps),
+                        cfg_scale_text=scale_text,
+                        cfg_scale_caption=scale_caption,
+                        cfg_scale_speaker=scale_speaker,
+                        cfg_guidance_mode=str(cfg_guidance_mode),
+                        cfg_min_t=float(cfg_min_t),
+                        cfg_max_t=float(cfg_max_t),
+                        seed=0,
+                        use_context_kv_cache=bool(context_kv_cache),
+                        t_schedule_mode=str(t_schedule_mode),
+                        sway_coeff=float(sway_coeff),
+                        cuda_graph_cache=self._cuda_graph_cache,
+                        encoded_conditions=encoded_conditions,
+                    )
+                    _log(
+                        f"[runtime] prewarm: captured graph for {seq_len} patched steps "
+                        f"(text {text_len})"
+                    )
+                    if self._cuda_graph_cache.get("__disabled__", False):
+                        return (
+                            "prewarm aborted: CUDA graph capture failed; running in eager mode."
+                        )
 
         # Release cached (non-graph) allocator blocks accumulated by the warmup
         # runs; graph private pools are owned by the graphs and stay intact.
         if self.model_device.type == "cuda":
             torch.cuda.empty_cache()
 
+        # Warm the decode/watermark stages last (after empty_cache, so their
+        # working-set allocations survive into the first real request). The
+        # first decode/watermark calls otherwise pay one-time cuDNN plan and
+        # allocator-growth costs of ~40 ms each. Sized to the prewarmed
+        # duration range so shorter real requests fit within the warmed blocks.
+        with self._infer_lock, torch.inference_mode():
+            if self.codec.device.type == "cuda":
+                dummy_latent = torch.zeros(
+                    (1, int(max_frames), self.codec.latent_dim),
+                    device=self.codec.device,
+                    dtype=torch.float32,
+                )
+                self.codec.decode_latent(dummy_latent)
+                _log("[runtime] prewarm: warmed codec decoder")
+
+            if self.watermarker.ready:
+                # Deterministic dummy signal so global RNG state stays
+                # untouched.
+                try:
+                    sample_rate = int(self.codec.sample_rate)
+                    t = torch.arange(int(max_frames) * hop_length, dtype=torch.float32)
+                    dummy_audio = (0.1 * torch.sin(2.0 * math.pi * 440.0 * t / sample_rate))[
+                        None, :
+                    ]
+                    self.watermarker.encode_batch([dummy_audio], sample_rate=sample_rate)
+                    _log("[runtime] prewarm: warmed watermarker")
+                except Exception as exc:  # pragma: no cover - defensive
+                    _log(f"[runtime] prewarm: watermark warmup skipped ({exc!r})")
+
         elapsed = time.perf_counter() - t_start
         graph_count = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
         lora_note = self._last_lora_token if self._last_lora_token is not None else "__base__"
         summary = (
-            f"prewarmed {len(lengths)} length buckets (<= {float(max_seconds):.1f}s) "
-            f"in {elapsed:.1f}s; graphs cached: {graph_count}\n"
+            f"prewarmed {len(lengths)} length buckets x {len(text_lengths)} text buckets "
+            f"(<= {float(max_seconds):.1f}s) in {elapsed:.1f}s; graphs cached: {graph_count}\n"
             f"lora: {lora_note}\n"
             "note: graphs are dropped if the LoRA Adapter Directory changes, "
             "unless LoRA Hot-Swap is enabled."

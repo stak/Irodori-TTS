@@ -135,6 +135,26 @@ def _get_warmup_stream() -> torch.cuda.Stream:
     return _WARMUP_STREAM
 
 
+def _end_pool_recording_after_failed_capture(device: torch.device, pool) -> None:
+    """
+    Best-effort allocator cleanup after an aborted CUDA graph capture.
+
+    torch.cuda.graph.__exit__ is skipped entirely when __enter__ raises, and a
+    capture invalidated mid-body can leave the caching allocator still
+    recording into the shared pool; the next capture using that pool then
+    fails with "beginAllocateToPool: already recording to mempool_id". Ending
+    the recording explicitly lets unrelated later captures proceed. The pool
+    itself must stay alive: previously captured graphs still reference it.
+    """
+    if pool is None:
+        return
+    try:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        torch._C._cuda_endAllocateToPool(index, pool)
+    except Exception:
+        pass
+
+
 @torch.inference_mode()
 def sample_euler_rf_cfg(
     model: TextToLatentRFDiT,
@@ -906,6 +926,7 @@ def sample_euler_rf_cfg(
             raise RuntimeError("CUDA graph replay mismatch against eager warmup output.")
     except Exception as exc:
         cuda_graph_cache["__disabled__"] = True
+        _end_pool_recording_after_failed_capture(device, cuda_graph_cache.get("__pool__"))
         print(f"[rf] CUDA graph capture disabled: {exc!r}", flush=True)
         if warm_out is not None:
             return warm_out[:, :valid_length].clone()
