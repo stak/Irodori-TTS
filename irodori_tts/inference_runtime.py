@@ -22,7 +22,12 @@ from safetensors.torch import load_file as load_safetensors_file
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
-from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
+from .lora import (
+    LORA_ADAPTER_CONFIG_NAME,
+    checkpoint_state_uses_lora,
+    is_lora_adapter_dir,
+    load_lora_adapter,
+)
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .speaker_inversion import (
@@ -267,6 +272,7 @@ class SamplingRequest:
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
     lora_adapter: str | None = None
+    lora_hot_swap: bool = False
 
 
 @dataclass
@@ -522,6 +528,8 @@ class InferenceRuntime:
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
         self._merged_lora_path: str | None = None
+        self._cuda_graph_cache: dict = {}
+        self._last_lora_token: str | None = None
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -641,6 +649,7 @@ class InferenceRuntime:
         messages: list[str],
         stage_timings: list[tuple[str, float]],
         log_fn: Callable[[str], None],
+        hot_swap: bool = False,
     ) -> Any:
         should_time = adapter_path is not None and str(adapter_path).strip() != ""
         t0 = _measure_start(self.model_device) if should_time else None
@@ -649,6 +658,7 @@ class InferenceRuntime:
                 adapter_path,
                 messages=messages,
                 log_fn=log_fn,
+                hot_swap=hot_swap,
             )
         finally:
             if t0 is not None:
@@ -656,14 +666,80 @@ class InferenceRuntime:
                 stage_timings.append(("prepare_lora", stage_sec))
                 log_fn(f"[runtime] prepare_lora: {stage_sec * 1000.0:.1f} ms")
 
+    def _lora_hot_swap_safe(self, resolved_path: str | None) -> tuple[bool, str]:
+        """
+        Check whether cached CUDA graphs can survive a LoRA switch.
+
+        Graphs reference weight *storage*, not values. merge/unmerge writes
+        deltas into the same storage, so graphs stay valid as long as no module
+        used inside the graph is replaced wholesale (modules_to_save) and the
+        previous adapter was actually merged.
+        """
+        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
+            return False, "LoRA merge is disabled (IRODORI_DISABLE_LORA_MERGE=1)"
+        if (
+            self._last_lora_token not in (None, "__base__")
+            and self._merged_lora_path != self._last_lora_token
+        ):
+            return False, "previous adapter was not merged into base weights"
+        if resolved_path is None:
+            return True, ""
+        try:
+            with open(Path(resolved_path) / LORA_ADAPTER_CONFIG_NAME, encoding="utf-8") as fh:
+                adapter_cfg = json.load(fh)
+        except Exception as exc:
+            return False, f"could not read adapter config ({exc!r})"
+        modules_to_save = adapter_cfg.get("modules_to_save") or []
+        unsafe_modules = [m for m in modules_to_save if m != "duration_predictor"]
+        if unsafe_modules:
+            return False, (
+                f"modules_to_save={unsafe_modules} replaces module storage used by graphs"
+            )
+        if adapter_cfg.get("use_dora"):
+            return False, "DoRA adapters are not supported for hot swap"
+        return True, ""
+
     def _prepare_lora_for_request_inner(
         self,
         adapter_path: str | None,
         *,
         messages: list[str],
         log_fn: Callable[[str], None],
+        hot_swap: bool = False,
     ) -> Any:
         resolved_path = self._resolve_lora_adapter_path(adapter_path)
+        lora_token = resolved_path if resolved_path is not None else "__base__"
+        if lora_token != self._last_lora_token:
+            cached_graphs = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
+            preserved = False
+            if hot_swap and cached_graphs > 0:
+                safe, reason = self._lora_hot_swap_safe(resolved_path)
+                if safe:
+                    preserved = True
+                    msg = (
+                        f"info: LoRA hot-swap: keeping {cached_graphs} cached CUDA "
+                        "graphs across adapter switch (weights are swapped in place; "
+                        "tiny fp rounding drift can accumulate per swap)."
+                    )
+                    messages.append(msg)
+                    log_fn(msg)
+                else:
+                    msg = f"info: LoRA hot-swap unavailable ({reason}); dropping cached graphs."
+                    messages.append(msg)
+                    log_fn(msg)
+            if not preserved:
+                # Captured CUDA graphs bake in the module structure/weights active
+                # at capture time; invalidate them when the LoRA state changes.
+                self._cuda_graph_cache.clear()
+                if cached_graphs > 0:
+                    msg = (
+                        f"warning: LoRA state changed ({self._last_lora_token} -> {lora_token}); "
+                        f"dropped {cached_graphs} cached CUDA graphs. Prewarm again with the same "
+                        "LoRA Adapter Directory, or enable LoRA Hot-Swap to keep them."
+                    )
+                    messages.append(msg)
+                    log_fn(msg)
+            self._last_lora_token = lora_token
         if resolved_path is None:
             self._unmerge_lora_if_needed(log_fn=log_fn)
             disable_adapter = getattr(self.model, "disable_adapter", None)
@@ -1039,6 +1115,7 @@ class InferenceRuntime:
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
+                hot_swap=bool(req.lora_hot_swap),
             ),
             torch.inference_mode(),
         ):
@@ -1227,6 +1304,7 @@ class InferenceRuntime:
                 speaker_kv_min_t=speaker_kv_min_t,
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
+                cuda_graph_cache=self._cuda_graph_cache,
                 encoded_conditions=encoded_conditions,
             )
             stage_sec = _measure_end(self.model_device, t0)
@@ -1316,7 +1394,166 @@ class InferenceRuntime:
             messages=messages,
         )
 
+    def prewarm_cuda_graphs(
+        self,
+        *,
+        lora_adapter: str | None = None,
+        lora_hot_swap: bool = False,
+        max_seconds: float = 15.0,
+        num_steps: int = 40,
+        num_candidates: int = 1,
+        cfg_guidance_mode: str = "independent",
+        cfg_scale_text: float = 3.0,
+        cfg_scale_caption: float = 3.0,
+        cfg_scale_speaker: float = 5.0,
+        cfg_scale: float | None = None,
+        cfg_min_t: float = 0.5,
+        cfg_max_t: float = 1.0,
+        context_kv_cache: bool = True,
+        t_schedule_mode: str = "linear",
+        sway_coeff: float = -1.0,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Capture CUDA graphs for every latent-length bucket up to max_seconds so
+        the first real generation of any duration takes the fast replay path.
+        Graphs are captured for the no-reference (LoRA / base voice) request
+        shape; requests with reference audio still capture on first use.
+        """
+
+        def _log(msg: str) -> None:
+            if log_fn is not None:
+                log_fn(msg)
+
+        if self.model_device.type != "cuda":
+            return "prewarm skipped: model device is not CUDA."
+        if os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() == "1":
+            return "prewarm skipped: IRODORI_DISABLE_CUDA_GRAPH=1."
+        if float(max_seconds) <= 0:
+            return "prewarm skipped: max_seconds must be > 0."
+
+        messages: list[str] = []
+        stage_timings: list[tuple[str, float]] = []
+        bucket = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_BUCKET", "16")))
+        hop_length = int(self.codec.model.hop_length)
+        max_frames = max(1, math.ceil(float(max_seconds) * self.codec.sample_rate / hop_length))
+        max_patched = math.ceil(max_frames / self.model_cfg.latent_patch_size)
+        max_padded = ((max_patched + bucket - 1) // bucket) * bucket
+        lengths = list(range(bucket, max_padded + 1, bucket))
+        max_entries = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_CACHE", "64")))
+        if len(lengths) > max_entries:
+            # Keep the shortest buckets: short utterances are by far the most
+            # common, so they must stay covered when the cache cannot hold all.
+            lengths = lengths[:max_entries]
+            messages.append(
+                f"warning: prewarm truncated to {max_entries} buckets "
+                f"(covers up to {lengths[-1] * self.model_cfg.latent_patch_size * hop_length / self.codec.sample_rate:.1f}s); "
+                "raise IRODORI_CUDA_GRAPH_CACHE or IRODORI_CUDA_GRAPH_BUCKET to cover more."
+            )
+        # Capture the largest bucket first so the shared memory pool is sized
+        # once and smaller graphs reuse its blocks.
+        lengths = sorted(lengths, reverse=True)
+
+        t_start = time.perf_counter()
+        with (
+            self._infer_lock,
+            self._prepare_lora_for_request(
+                lora_adapter,
+                messages=messages,
+                stage_timings=stage_timings,
+                log_fn=_log,
+                hot_swap=bool(lora_hot_swap),
+            ),
+            torch.inference_mode(),
+        ):
+            text_ids, text_mask = self.tokenizer.batch_encode(
+                ["こんにちは。"] * int(num_candidates),
+                max_length=self.default_text_max_len,
+            )
+            text_ids = text_ids.to(self.model_device)
+            text_mask = text_mask.to(self.model_device)
+            caption_ids = None
+            caption_mask = None
+            if self.model_cfg.use_caption_condition and self.caption_tokenizer is not None:
+                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
+                    [""] * int(num_candidates),
+                    max_length=self.default_caption_max_len,
+                )
+                caption_mask.zero_()
+                caption_ids = caption_ids.to(self.model_device)
+                caption_mask = caption_mask.to(self.model_device)
+            ref_latent, ref_mask = self._load_reference_latent(
+                req=SamplingRequest(text="prewarm", no_ref=True),
+                batch_size=int(num_candidates),
+                messages=messages,
+            )
+            scale_text, scale_caption, scale_speaker, _ = resolve_cfg_scales(
+                cfg_guidance_mode=cfg_guidance_mode,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                cfg_scale=cfg_scale,
+                use_caption_condition=False,
+                use_speaker_condition=False,
+            )
+            encoded_conditions = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+            )
+            for seq_len in lengths:
+                sample_euler_rf_cfg(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    sequence_length=int(seq_len),
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    num_steps=int(num_steps),
+                    cfg_scale_text=scale_text,
+                    cfg_scale_caption=scale_caption,
+                    cfg_scale_speaker=scale_speaker,
+                    cfg_guidance_mode=str(cfg_guidance_mode),
+                    cfg_min_t=float(cfg_min_t),
+                    cfg_max_t=float(cfg_max_t),
+                    seed=0,
+                    use_context_kv_cache=bool(context_kv_cache),
+                    t_schedule_mode=str(t_schedule_mode),
+                    sway_coeff=float(sway_coeff),
+                    cuda_graph_cache=self._cuda_graph_cache,
+                    encoded_conditions=encoded_conditions,
+                )
+                _log(f"[runtime] prewarm: captured graph for {seq_len} patched steps")
+                if self._cuda_graph_cache.get("__disabled__", False):
+                    return "prewarm aborted: CUDA graph capture failed; running in eager mode."
+
+        # Release cached (non-graph) allocator blocks accumulated by the warmup
+        # runs; graph private pools are owned by the graphs and stay intact.
+        if self.model_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        elapsed = time.perf_counter() - t_start
+        graph_count = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
+        lora_note = self._last_lora_token if self._last_lora_token is not None else "__base__"
+        summary = (
+            f"prewarmed {len(lengths)} length buckets (<= {float(max_seconds):.1f}s) "
+            f"in {elapsed:.1f}s; graphs cached: {graph_count}\n"
+            f"lora: {lora_note}\n"
+            "note: graphs are dropped if the LoRA Adapter Directory changes, "
+            "unless LoRA Hot-Swap is enabled."
+        )
+        for msg in messages:
+            _log(msg)
+        _log(f"[runtime] {summary}")
+        return summary
+
     def unload(self) -> None:
+        self._cuda_graph_cache.clear()
         del self.model
         del self.tokenizer
         del self.codec

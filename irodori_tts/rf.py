@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -117,6 +118,23 @@ def scale_speaker_kv_cache(
         v_speaker.mul_(scale)
 
 
+_WARMUP_STREAM: torch.cuda.Stream | None = None
+
+
+def _get_warmup_stream() -> torch.cuda.Stream:
+    """
+    Reuse one side stream for all pre-capture warmup runs. Creating a fresh
+    stream per capture makes the caching allocator strand each warmup's
+    working set on a dead stream (blocks are only reused on the stream they
+    were allocated on), which inflates VRAM by hundreds of MB per captured
+    graph.
+    """
+    global _WARMUP_STREAM
+    if _WARMUP_STREAM is None:
+        _WARMUP_STREAM = torch.cuda.Stream()
+    return _WARMUP_STREAM
+
+
 @torch.inference_mode()
 def sample_euler_rf_cfg(
     model: TextToLatentRFDiT,
@@ -148,6 +166,7 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
+    cuda_graph_cache: dict | None = None,
     encoded_conditions: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -480,15 +499,319 @@ def sample_euler_rf_cfg(
             )
     speaker_kv_active = speaker_kv_scale is not None
 
-    for i in range(num_steps):
-        t = t_values[i]
-        t_next = t_values[i + 1]
-        tt = torch.full((batch_size,), t, device=device, dtype=dtype)
+    # Optional padding mask for CUDA-graph length bucketing (set below). Masked
+    # (padded) latent positions are excluded from attention keys, so outputs at
+    # valid positions are bit-identical to an unpadded run.
+    latent_mask: torch.Tensor | None = None
 
-        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t <= cfg_max_t)
-        if use_cfg and use_independent_cfg:
+    def _run_sampling_loop(x_start: torch.Tensor) -> torch.Tensor:
+        nonlocal speaker_kv_active
+        if latent_mask is not None and cfg_batch_mult > 1:
+            latent_mask_rep = torch.cat([latent_mask] * cfg_batch_mult, dim=0)
+        else:
+            latent_mask_rep = latent_mask
+        x_t = x_start
+        for i in range(num_steps):
+            t = t_values[i]
+            t_next = t_values[i + 1]
+            tt = torch.full((batch_size,), t, device=device, dtype=dtype)
+
+            use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t <= cfg_max_t)
+            if use_cfg and use_independent_cfg:
+                x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
+                tt_cfg = tt.repeat(cfg_batch_mult)
+                v_out = model.forward_with_encoded_conditions(
+                    x_t=x_t_cfg,
+                    t=tt_cfg,
+                    text_state=independent_text_state,
+                    text_mask=independent_text_mask,
+                    speaker_state=independent_speaker_state,
+                    speaker_mask=independent_speaker_mask,
+                    caption_state=independent_caption_state,
+                    caption_mask=independent_caption_mask,
+                    latent_mask=latent_mask_rep,
+                    context_kv_cache=context_kv_cfg,
+                )
+                chunks = v_out.chunk(cfg_batch_mult, dim=0)
+                v = chunks[0]
+                for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
+                    v = v + cfg_scales[name] * (chunks[0] - chunk)
+            elif use_cfg:
+                v_cond = model.forward_with_encoded_conditions(
+                    x_t=x_t.to(dtype),
+                    t=tt,
+                    text_state=text_state_cond,
+                    text_mask=text_mask_cond,
+                    speaker_state=speaker_state_cond,
+                    speaker_mask=speaker_mask_cond,
+                    caption_state=caption_state_cond,
+                    caption_mask=caption_mask_cond,
+                    latent_mask=latent_mask,
+                    context_kv_cache=context_kv_cond,
+                )
+                if use_joint_cfg:
+                    if len(enabled_cfg_names) > 1:
+                        joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
+                        if max(joint_scales) - min(joint_scales) > 1e-6:
+                            raise ValueError(
+                                "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
+                                "set matching text/speaker/caption scales or use --cfg-scale."
+                            )
+                    joint_scale = cfg_scales[enabled_cfg_names[0]]
+                    v_uncond_joint = model.forward_with_encoded_conditions(
+                        x_t=x_t.to(dtype),
+                        t=tt,
+                        text_state=joint_uncond_bundle[0],
+                        text_mask=joint_uncond_bundle[1],
+                        speaker_state=joint_uncond_bundle[2],
+                        speaker_mask=joint_uncond_bundle[3],
+                        caption_state=joint_uncond_bundle[4],
+                        caption_mask=joint_uncond_bundle[5],
+                        latent_mask=latent_mask,
+                        context_kv_cache=context_kv_joint_uncond,
+                    )
+                    v = v_cond + joint_scale * (v_cond - v_uncond_joint)
+                elif use_alternating_cfg:
+                    alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
+                    alt_bundle = alternating_bundles[alt_name]
+                    v_uncond_alt = model.forward_with_encoded_conditions(
+                        x_t=x_t.to(dtype),
+                        t=tt,
+                        text_state=alt_bundle[0],
+                        text_mask=alt_bundle[1],
+                        speaker_state=alt_bundle[2],
+                        speaker_mask=alt_bundle[3],
+                        caption_state=alt_bundle[4],
+                        caption_mask=alt_bundle[5],
+                        latent_mask=latent_mask,
+                        context_kv_cache=context_kv_alternating.get(alt_name),
+                    )
+                    v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
+                else:
+                    raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
+            else:
+                v = model.forward_with_encoded_conditions(
+                    x_t=x_t.to(dtype),
+                    t=tt,
+                    text_state=text_state_cond,
+                    text_mask=text_mask_cond,
+                    speaker_state=speaker_state_cond,
+                    speaker_mask=speaker_mask_cond,
+                    caption_state=caption_state_cond,
+                    caption_mask=caption_mask_cond,
+                    latent_mask=latent_mask,
+                    context_kv_cache=context_kv_cond,
+                )
+
+            if rescale_k is not None and rescale_sigma is not None:
+                v = temporal_score_rescale(
+                    v_pred=v,
+                    x_t=x_t,
+                    t=t,
+                    rescale_k=float(rescale_k),
+                    rescale_sigma=float(rescale_sigma),
+                )
+
+            if (
+                speaker_kv_active
+                and speaker_kv_min_t is not None
+                and (t_next < speaker_kv_min_t)
+                and (t >= speaker_kv_min_t)
+            ):
+                inv_scale = 1.0 / float(speaker_kv_scale)
+                scale_speaker_kv_cache(
+                    context_kv_cache=context_kv_cond,
+                    scale=inv_scale,
+                    max_layers=speaker_kv_max_layers,
+                )
+                if context_kv_cfg is not None:
+                    scale_speaker_kv_cache(
+                        context_kv_cache=context_kv_cfg,
+                        scale=inv_scale,
+                        max_layers=speaker_kv_max_layers,
+                    )
+                for cache in context_kv_alternating.values():
+                    scale_speaker_kv_cache(
+                        context_kv_cache=cache,
+                        scale=inv_scale,
+                        max_layers=speaker_kv_max_layers,
+                    )
+                speaker_kv_active = False
+
+            x_t = x_t + v * (t_next - t)
+
+        return x_t
+
+    # ---- CUDA Graph fast path -------------------------------------------------
+    # On Windows (no Triton/torch.compile) the sampling loop is dominated by
+    # per-kernel CPU launch overhead. Capturing the whole Euler loop as a CUDA
+    # graph and replaying it removes that overhead. The replayed kernels are
+    # bit-identical to eager execution, so output audio does not change.
+    graph_supported = (
+        cuda_graph_cache is not None
+        and device.type == "cuda"
+        and cfg_guidance_mode == "independent"
+        and rescale_k is None
+        and speaker_kv_scale is None
+        and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
+        and not cuda_graph_cache.get("__disabled__", False)
+    )
+    if not graph_supported:
+        return _run_sampling_loop(x_t)
+
+    # Length bucketing: pad the latent sequence up to a multiple of
+    # IRODORI_CUDA_GRAPH_BUCKET patched steps and mask the padded tail, so texts
+    # with similar predicted durations share one captured graph instead of each
+    # unique length triggering a fresh (slow) capture. Masked positions cannot
+    # influence valid positions, and the valid-region noise is unchanged, so
+    # results are bit-identical to an unpadded run.
+    bucket = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_BUCKET", "16")))
+    valid_length = int(sequence_length)
+    padded_length = ((valid_length + bucket - 1) // bucket) * bucket
+    if padded_length != valid_length:
+        pad_tail = torch.zeros(
+            (batch_size, padded_length - valid_length, latent_dim),
+            device=device,
+            dtype=x_t.dtype,
+        )
+        x_t = torch.cat([x_t, pad_tail], dim=1)
+    latent_mask = torch.zeros((batch_size, padded_length), dtype=torch.bool, device=device)
+    latent_mask[:, :valid_length] = True
+
+    def _flatten_kv(kv: list[tuple[torch.Tensor, ...]] | None) -> list[torch.Tensor]:
+        if kv is None:
+            return []
+        return [tensor for layer in kv for tensor in layer]
+
+    # Condition tensors (text/speaker/caption states and projected KV caches) do
+    # not depend on the latent length, so a single shared set of static buffers
+    # serves every captured graph. VRAM therefore does not grow with the number
+    # of cached graphs; each graph only owns its (tiny) x_t/latent_mask buffers.
+    named_cond = [
+        independent_text_state,
+        independent_text_mask,
+        independent_speaker_state,
+        independent_speaker_mask,
+        independent_caption_state,
+        independent_caption_mask,
+        text_state_cond,
+        text_mask_cond,
+        speaker_state_cond,
+        speaker_mask_cond,
+        caption_state_cond,
+        caption_mask_cond,
+    ]
+    presence = tuple(value is not None for value in named_cond)
+    flat_named = [value for value in named_cond if value is not None]
+    kv_cfg_arity = None if context_kv_cfg is None else tuple(len(layer) for layer in context_kv_cfg)
+    kv_cond_arity = (
+        None if context_kv_cond is None else tuple(len(layer) for layer in context_kv_cond)
+    )
+    cond_flat = [*flat_named, *_flatten_kv(context_kv_cfg), *_flatten_kv(context_kv_cond)]
+    cond_sig = (
+        presence,
+        kv_cfg_arity,
+        kv_cond_arity,
+        tuple((tuple(tensor.shape), str(tensor.dtype)) for tensor in cond_flat),
+    )
+
+    shared_bundles = cuda_graph_cache.setdefault("__cond__", {})
+    shared_flat = shared_bundles.get(cond_sig)
+    if shared_flat is None:
+        # Adopt this request's tensors as the shared static buffers.
+        shared_bundles[cond_sig] = cond_flat
+        shared_flat = cond_flat
+    else:
+        # Copy this request's condition values into the shared buffers and
+        # rebind the loop variables so the (re)captured/replayed graph reads
+        # from the shared storage.
+        for static_buf, new_value in zip(shared_flat, cond_flat, strict=True):
+            static_buf.copy_(new_value)
+        buffer_iter = iter(shared_flat)
+        rebound = [next(buffer_iter) if flag else None for flag in presence]
+        (
+            independent_text_state,
+            independent_text_mask,
+            independent_speaker_state,
+            independent_speaker_mask,
+            independent_caption_state,
+            independent_caption_mask,
+            text_state_cond,
+            text_mask_cond,
+            speaker_state_cond,
+            speaker_mask_cond,
+            caption_state_cond,
+            caption_mask_cond,
+        ) = rebound
+        pos = len(flat_named)
+        if kv_cfg_arity is not None:
+            rebuilt: list[tuple[torch.Tensor, ...]] = []
+            for arity in kv_cfg_arity:
+                rebuilt.append(tuple(shared_flat[pos : pos + arity]))
+                pos += arity
+            context_kv_cfg = rebuilt
+        if kv_cond_arity is not None:
+            rebuilt = []
+            for arity in kv_cond_arity:
+                rebuilt.append(tuple(shared_flat[pos : pos + arity]))
+                pos += arity
+            context_kv_cond = rebuilt
+
+    # Note: num_steps, cfg_min_t/max_t, t-schedule and sway are deliberately NOT
+    # part of the key. Per-step graphs receive t/dt via input buffers, and the
+    # schedule only determines the Python-side replay sequence, so cached graphs
+    # remain valid when those sampling parameters change. Only the CFG scales
+    # (baked into the guidance combine) and tensor shapes identify a graph.
+    graph_key = (
+        int(batch_size),
+        int(padded_length),
+        str(dtype),
+        tuple(independent_names),
+        tuple(sorted(cfg_scales.items())),
+        bool(effective_use_context_kv_cache),
+        cond_sig,
+    )
+
+    # Per-STEP CUDA graphs: capturing one sampling step (instead of the whole
+    # num_steps loop) keeps the driver-side cudaGraphExec memory ~num_steps
+    # times smaller while still removing almost all kernel-launch overhead.
+    # The Python loop between replays only issues two tiny fill kernels.
+    step_is_cfg = [
+        bool(enabled_cfg_names) and (cfg_min_t <= t_values[i] <= cfg_max_t)
+        for i in range(num_steps)
+    ]
+
+    def _replay_entry(entry: dict) -> torch.Tensor:
+        tt_buf = entry["tt"]
+        dt_buf = entry["dt"]
+        graph_cfg = entry["graph_cfg"]
+        graph_plain = entry["graph_plain"]
+        for i in range(num_steps):
+            tt_buf.fill_(t_values[i])
+            dt_buf.fill_(t_values[i + 1] - t_values[i])
+            if step_is_cfg[i]:
+                graph_cfg.replay()
+            else:
+                graph_plain.replay()
+        return entry["x"]
+
+    entry = cuda_graph_cache.get(graph_key)
+    if entry is not None:
+        entry["x"].copy_(x_t)
+        entry["mask"].copy_(latent_mask)
+        out = _replay_entry(entry)
+        return out[:, :valid_length].clone()
+
+    x_initial = x_t.clone()
+    warm_out: torch.Tensor | None = None
+    try:
+        tt_static = torch.empty((batch_size,), device=device, dtype=dtype)
+        dt_static = torch.empty((), device=device, dtype=dtype)
+
+        def _step_cfg() -> None:
             x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
-            tt_cfg = tt.repeat(cfg_batch_mult)
+            tt_cfg = tt_static.repeat(cfg_batch_mult)
+            latent_mask_rep = torch.cat([latent_mask] * cfg_batch_mult, dim=0)
             v_out = model.forward_with_encoded_conditions(
                 x_t=x_t_cfg,
                 t=tt_cfg,
@@ -498,110 +821,105 @@ def sample_euler_rf_cfg(
                 speaker_mask=independent_speaker_mask,
                 caption_state=independent_caption_state,
                 caption_mask=independent_caption_mask,
+                latent_mask=latent_mask_rep,
                 context_kv_cache=context_kv_cfg,
             )
             chunks = v_out.chunk(cfg_batch_mult, dim=0)
             v = chunks[0]
             for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
                 v = v + cfg_scales[name] * (chunks[0] - chunk)
-        elif use_cfg:
-            v_cond = model.forward_with_encoded_conditions(
-                x_t=x_t.to(dtype),
-                t=tt,
-                text_state=text_state_cond,
-                text_mask=text_mask_cond,
-                speaker_state=speaker_state_cond,
-                speaker_mask=speaker_mask_cond,
-                caption_state=caption_state_cond,
-                caption_mask=caption_mask_cond,
-                context_kv_cache=context_kv_cond,
-            )
-            if use_joint_cfg:
-                if len(enabled_cfg_names) > 1:
-                    joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
-                    if max(joint_scales) - min(joint_scales) > 1e-6:
-                        raise ValueError(
-                            "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
-                            "set matching text/speaker/caption scales or use --cfg-scale."
-                        )
-                joint_scale = cfg_scales[enabled_cfg_names[0]]
-                v_uncond_joint = model.forward_with_encoded_conditions(
-                    x_t=x_t.to(dtype),
-                    t=tt,
-                    text_state=joint_uncond_bundle[0],
-                    text_mask=joint_uncond_bundle[1],
-                    speaker_state=joint_uncond_bundle[2],
-                    speaker_mask=joint_uncond_bundle[3],
-                    caption_state=joint_uncond_bundle[4],
-                    caption_mask=joint_uncond_bundle[5],
-                    context_kv_cache=context_kv_joint_uncond,
-                )
-                v = v_cond + joint_scale * (v_cond - v_uncond_joint)
-            elif use_alternating_cfg:
-                alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
-                alt_bundle = alternating_bundles[alt_name]
-                v_uncond_alt = model.forward_with_encoded_conditions(
-                    x_t=x_t.to(dtype),
-                    t=tt,
-                    text_state=alt_bundle[0],
-                    text_mask=alt_bundle[1],
-                    speaker_state=alt_bundle[2],
-                    speaker_mask=alt_bundle[3],
-                    caption_state=alt_bundle[4],
-                    caption_mask=alt_bundle[5],
-                    context_kv_cache=context_kv_alternating.get(alt_name),
-                )
-                v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
-            else:
-                raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
-        else:
+            x_t.add_(v * dt_static)
+
+        def _step_plain() -> None:
             v = model.forward_with_encoded_conditions(
                 x_t=x_t.to(dtype),
-                t=tt,
+                t=tt_static,
                 text_state=text_state_cond,
                 text_mask=text_mask_cond,
                 speaker_state=speaker_state_cond,
                 speaker_mask=speaker_mask_cond,
                 caption_state=caption_state_cond,
                 caption_mask=caption_mask_cond,
+                latent_mask=latent_mask,
                 context_kv_cache=context_kv_cond,
             )
+            x_t.add_(v * dt_static)
 
-        if rescale_k is not None and rescale_sigma is not None:
-            v = temporal_score_rescale(
-                v_pred=v,
-                x_t=x_t,
-                t=t,
-                rescale_k=float(rescale_k),
-                rescale_sigma=float(rescale_sigma),
-            )
+        def _run_step_loop() -> torch.Tensor:
+            for i in range(num_steps):
+                tt_static.fill_(t_values[i])
+                dt_static.fill_(t_values[i + 1] - t_values[i])
+                if step_is_cfg[i]:
+                    _step_cfg()
+                else:
+                    _step_plain()
+            return x_t
 
-        if (
-            speaker_kv_active
-            and speaker_kv_min_t is not None
-            and (t_next < speaker_kv_min_t)
-            and (t >= speaker_kv_min_t)
-        ):
-            inv_scale = 1.0 / float(speaker_kv_scale)
-            scale_speaker_kv_cache(
-                context_kv_cache=context_kv_cond,
-                scale=inv_scale,
-                max_layers=speaker_kv_max_layers,
-            )
-            if context_kv_cfg is not None:
-                scale_speaker_kv_cache(
-                    context_kv_cache=context_kv_cfg,
-                    scale=inv_scale,
-                    max_layers=speaker_kv_max_layers,
-                )
-            for cache in context_kv_alternating.values():
-                scale_speaker_kv_cache(
-                    context_kv_cache=cache,
-                    scale=inv_scale,
-                    max_layers=speaker_kv_max_layers,
-                )
-            speaker_kv_active = False
+        # Both step variants are captured regardless of whether the current
+        # schedule uses them, so the cached entry stays valid when num_steps,
+        # the t-schedule, or cfg_min_t/max_t change later.
+        capture_cfg_variant = bool(enabled_cfg_names)
 
-        x_t = x_t + v * (t_next - t)
+        # Warmup on a shared side stream (also produces a correct result we can
+        # fall back to if graph capture is unsupported on this platform).
+        warm_stream = _get_warmup_stream()
+        warm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm_stream):
+            warm_out = _run_step_loop().clone()
+            # Ensure cuBLAS/cuDNN are initialized for BOTH variants before
+            # capture, even if the current schedule exercises only one kind.
+            if capture_cfg_variant:
+                _step_cfg()
+            _step_plain()
+        torch.cuda.current_stream().wait_stream(warm_stream)
+        torch.cuda.synchronize(device)
 
-    return x_t
+        # All graphs share one memory pool: intermediates of different graphs
+        # reuse the same VRAM (replays are serialized by the runtime lock, and
+        # outputs are cloned immediately after each replay sequence).
+        pool = cuda_graph_cache.get("__pool__")
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            cuda_graph_cache["__pool__"] = pool
+        graph_cfg = None
+        if capture_cfg_variant:
+            graph_cfg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph_cfg, pool=pool):
+                _step_cfg()
+        graph_plain = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph_plain, pool=pool):
+            _step_plain()
+
+        entry = {
+            "x": x_t,
+            "mask": latent_mask,
+            "tt": tt_static,
+            "dt": dt_static,
+            "graph_cfg": graph_cfg,
+            "graph_plain": graph_plain,
+        }
+        # Validate one full replay sequence against the eager warmup result.
+        x_t.copy_(x_initial)
+        replay_out = _replay_entry(entry)
+        torch.cuda.synchronize(device)
+        if not torch.equal(replay_out, warm_out):
+            raise RuntimeError("CUDA graph replay mismatch against eager warmup output.")
+    except Exception as exc:
+        cuda_graph_cache["__disabled__"] = True
+        print(f"[rf] CUDA graph capture disabled: {exc!r}", flush=True)
+        if warm_out is not None:
+            return warm_out[:, :valid_length].clone()
+        x_t.copy_(x_initial)
+        return _run_sampling_loop(x_t)[:, :valid_length].clone()
+
+    max_entries = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_CACHE", "64")))
+    graph_keys = [key for key in cuda_graph_cache if not isinstance(key, str)]
+    while len(graph_keys) >= max_entries:
+        cuda_graph_cache.pop(graph_keys.pop(0), None)
+    cuda_graph_cache[graph_key] = entry
+    print(
+        f"[rf] captured CUDA step graphs: padded_length={padded_length} "
+        f"(entries cached: {len(graph_keys) + 1})",
+        flush=True,
+    )
+    return replay_out[:, :valid_length].clone()
