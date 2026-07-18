@@ -521,6 +521,7 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._merged_lora_path: str | None = None
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -664,6 +665,7 @@ class InferenceRuntime:
     ) -> Any:
         resolved_path = self._resolve_lora_adapter_path(adapter_path)
         if resolved_path is None:
+            self._unmerge_lora_if_needed(log_fn=log_fn)
             disable_adapter = getattr(self.model, "disable_adapter", None)
             if callable(disable_adapter):
                 msg = "info: dynamic LoRA disabled for this request; using base model."
@@ -674,6 +676,14 @@ class InferenceRuntime:
 
         if self.key.compile_model:
             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+
+        if self._merged_lora_path == resolved_path:
+            msg = f"info: using merged LoRA adapter (cached): {resolved_path}"
+            messages.append(msg)
+            log_fn(msg)
+            return nullcontext()
+
+        self._unmerge_lora_if_needed(log_fn=log_fn)
 
         adapter_name = self._lora_adapter_names.get(resolved_path)
         if adapter_name is None:
@@ -700,7 +710,46 @@ class InferenceRuntime:
             dtype=self._model_dtype,
         )
         self.model.eval()
+        self._merge_lora_for_speed(resolved_path, messages=messages, log_fn=log_fn)
         return nullcontext()
+
+    def _merge_lora_for_speed(
+        self,
+        resolved_path: str,
+        *,
+        messages: list[str],
+        log_fn: Callable[[str], None],
+    ) -> None:
+        """
+        Merge the active LoRA adapter into base weights so sampling avoids the
+        extra low-rank matmuls on every forward pass. Mathematically equivalent
+        (up to float rounding) to running with an unmerged adapter.
+        """
+        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
+            return
+        merge_adapter = getattr(self.model, "merge_adapter", None)
+        if not callable(merge_adapter):
+            return
+        try:
+            merge_adapter()
+        except Exception as exc:  # pragma: no cover - defensive
+            msg = f"warning: LoRA merge failed ({exc!r}); using unmerged adapter."
+            messages.append(msg)
+            log_fn(msg)
+            return
+        self._merged_lora_path = resolved_path
+        msg = "info: merged LoRA adapter into base weights for faster inference."
+        messages.append(msg)
+        log_fn(msg)
+
+    def _unmerge_lora_if_needed(self, *, log_fn: Callable[[str], None]) -> None:
+        if self._merged_lora_path is None:
+            return
+        unmerge_adapter = getattr(self.model, "unmerge_adapter", None)
+        if callable(unmerge_adapter):
+            unmerge_adapter()
+            log_fn(f"[runtime] unmerged LoRA adapter: {self._merged_lora_path}")
+        self._merged_lora_path = None
 
     def _load_reference_latent(
         self,
