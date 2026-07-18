@@ -123,11 +123,16 @@ def _enable_cuda_fast_math() -> None:
     # TF32 for matmuls only. Empirically, forcing TF32/cudnn-benchmark on the
     # codec's convolutional decoder can select much slower conv algorithms, so
     # convolutions are left at default fp32 behavior.
+    #
+    # Use the legacy allow_tf32 flag rather than the >=2.9 fp32_precision API:
+    # torch 2.10 raises on mixing the two, and inductor's pad_mm pass still
+    # READS the legacy flag for fp32 matmuls, so setting the new API breaks
+    # torch.compile of fp32 models ("mix of the legacy and new APIs" error).
+    # Fall back to the new API if a future release removes the legacy setter.
     try:
-        # PyTorch >= 2.9 fp32 precision API.
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-    except Exception:
         torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
     _FAST_MATH_CONFIGURED = True
 
 
