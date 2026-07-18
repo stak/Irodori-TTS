@@ -29,7 +29,11 @@ from .lora import (
     load_lora_adapter,
 )
 from .model import TextToLatentRFDiT
-from .rf import _get_warmup_stream, sample_euler_rf_cfg
+from .rf import (
+    _end_pool_recording_after_failed_capture,
+    _get_warmup_stream,
+    sample_euler_rf_cfg,
+)
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -316,17 +320,28 @@ def _maybe_compile_inference_model(
     enabled: bool,
     dynamic: bool,
 ) -> TextToLatentRFDiT:
+    # IRODORI_COMPILE=1 opts into torch.compile without changing the runtime
+    # key (requires a working Triton toolchain: Linux/WSL2 + a C compiler).
+    # Compiled kernels are replayed inside the CUDA step graphs, combining
+    # inductor's kernel fusion with graph replay's zero launch overhead.
+    if os.environ.get("IRODORI_COMPILE", "0").strip() == "1":
+        enabled = True
     if not enabled:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("compile_model=True requires torch.compile (PyTorch 2+).")
-    compile_kwargs = {"dynamic": bool(dynamic)}
+    # dynamic=None (auto) compiles the first-seen shape statically and switches
+    # to dynamic-shape kernels on the second, so the many latent-length buckets
+    # do not each pay a full compile.
+    compile_kwargs = {"dynamic": True if dynamic else None}
     model.encode_conditions = torch.compile(model.encode_conditions, **compile_kwargs)
     model.build_context_kv_cache = torch.compile(model.build_context_kv_cache, **compile_kwargs)
     model.forward_with_encoded_conditions = torch.compile(
         model.forward_with_encoded_conditions,
         **compile_kwargs,
     )
+    model._irodori_compiled = True
+    print("[runtime] torch.compile enabled for inference model", flush=True)
     return model
 
 
@@ -633,6 +648,26 @@ class InferenceRuntime:
                 "Use a compatible codec/checkpoint pair."
             )
 
+        # Build the lazily-grown RoPE caches now (normal mode, before any
+        # compile or CUDA graph capture) so they never rebuild inside compiled
+        # or captured code. Sized to the default max_seconds bound (30 s);
+        # longer manual requests just rebuild lazily as before.
+        hop_length = int(codec.model.hop_length)
+        max_frames = max(1, math.ceil(30.0 * codec.sample_rate / hop_length))
+        graph_bucket = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_BUCKET", "16")))
+        max_patched = math.ceil(max_frames / model_cfg.latent_patch_size)
+        max_padded = ((max_patched + graph_bucket - 1) // graph_bucket) * graph_bucket
+        speaker_len = None
+        if model_cfg.use_speaker_condition_resolved:
+            speaker_len = (
+                math.ceil(max_frames / max(1, int(model_cfg.speaker_patch_size))) + 1
+            )
+        model.prewarm_rope_caches(
+            text_len=default_text_max_len,
+            latent_len=max_padded,
+            speaker_len=speaker_len,
+        )
+
         return cls(
             key=key,
             model_cfg=model_cfg,
@@ -779,8 +814,13 @@ class InferenceRuntime:
                 return disable_adapter()
             return nullcontext()
 
-        if self.key.compile_model:
-            raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+        if getattr(self.model, "_irodori_compiled", False):
+            msg = (
+                "info: torch.compile is active; the LoRA structure change triggers a "
+                "one-time recompile during the next warmup (prewarm absorbs it)."
+            )
+            messages.append(msg)
+            log_fn(msg)
 
         if self._merged_lora_path == resolved_path:
             msg = f"info: using merged LoRA adapter (cached): {resolved_path}"
@@ -1157,6 +1197,9 @@ class InferenceRuntime:
                 )
         except Exception as exc:
             self._cuda_graph_cache["__duration_disabled__"] = True
+            _end_pool_recording_after_failed_capture(
+                self.model_device, self._cuda_graph_cache.get("__pool__")
+            )
             log_fn(f"[runtime] duration CUDA graph disabled: {exc!r}")
             return _run_eager()
 

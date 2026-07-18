@@ -48,18 +48,29 @@ _TIMESTEP_FREQS_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
-    # Cache the frequency table per (device, half). Recomputing it every call
-    # issued a host-to-device copy (torch.tensor on CUDA), which is slow and
-    # not permitted inside CUDA graph capture.
-    cache_key = (timestep.device, half)
-    freqs = _TIMESTEP_FREQS_CACHE.get(cache_key)
-    if freqs is None:
+    if torch.compiler.is_compiling():
+        # The dict cache below would bake a stale membership guard into the
+        # compiled artifact (the entry exists on the next call, forcing a
+        # recompile - potentially inside a CUDA graph capture). Inductor
+        # constant-folds this expression, so computing it inline costs
+        # nothing when compiling.
         freqs = 1000.0 * torch.exp(
-            -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
-            * torch.arange(half, device=timestep.device, dtype=torch.float32)
-            / half
+            torch.arange(half, device=timestep.device, dtype=torch.float32)
+            * (-math.log(10000.0) / half)
         )
-        _TIMESTEP_FREQS_CACHE[cache_key] = freqs
+    else:
+        # Cache the frequency table per (device, half). Recomputing it every
+        # call issued a host-to-device copy (torch.tensor on CUDA), which is
+        # slow and not permitted inside CUDA graph capture.
+        cache_key = (timestep.device, half)
+        freqs = _TIMESTEP_FREQS_CACHE.get(cache_key)
+        if freqs is None:
+            freqs = 1000.0 * torch.exp(
+                -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
+                * torch.arange(half, device=timestep.device, dtype=torch.float32)
+                / half
+            )
+            _TIMESTEP_FREQS_CACHE[cache_key] = freqs
     args = timestep[:, None].float() * freqs[None, :]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
 
@@ -447,11 +458,14 @@ def _safe_attention_mask(
         )
     mask = mask.to(device=x.device, dtype=torch.bool)
     has_any = mask.any(dim=1)
-    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+    if torch.compiler.is_compiling() or (x.is_cuda and torch.cuda.is_current_stream_capturing()):
         # bool(has_any.all()) requires a GPU->CPU sync, which is illegal while
-        # a CUDA graph is being captured. Apply the empty-row fix branchlessly
-        # instead; when every row has a valid position (the usual case) the
-        # result is value-identical to the early-return path.
+        # a CUDA graph is being captured, and under torch.compile the
+        # capture-status branch would specialize on trace-time state (forcing
+        # a recompile inside a later capture). Apply the empty-row fix
+        # branchlessly in both situations; when every row has a valid position
+        # (the usual case) the result is value-identical to the early-return
+        # path.
         if x.shape[1] <= 0:
             raise ValueError("Cannot attention-pool an empty sequence.")
         x = torch.where(has_any[:, None, None], x, torch.zeros((), device=x.device, dtype=x.dtype))
@@ -1380,6 +1394,32 @@ class TextToLatentRFDiT(nn.Module):
             cache = precompute_freqs_cis(self.head_dim, seq_len).to(device)
             self._freqs_cis_cache = cache
         return cache[:seq_len]
+
+    def prewarm_rope_caches(
+        self,
+        *,
+        text_len: int,
+        latent_len: int,
+        speaker_len: int | None = None,
+    ) -> None:
+        """
+        Build the lazily-grown RoPE frequency caches up front.
+
+        The caches are rebuilt inside the forward paths whenever too short.
+        Under torch.compile that lazy rebuild bakes an immediately-stale guard
+        into the compiled artifact (and a buffer rebuilt under inference_mode
+        changes dispatch keys), forcing recompiles on later calls - possibly
+        inside a CUDA graph capture, which invalidates the capture. Building
+        the caches here, before any compile or capture, keeps them stable.
+        """
+        device = self.device
+        self._rope_freqs(max(1, int(latent_len)), device)
+        text_encoder = getattr(self, "text_encoder", None)
+        if text_encoder is not None:
+            text_encoder._rope_freqs(max(1, int(text_len)), device)
+        speaker_encoder = getattr(self, "speaker_encoder", None)
+        if speaker_len is not None and speaker_encoder is not None:
+            speaker_encoder._rope_freqs(max(1, int(speaker_len)), device)
 
     @staticmethod
     def _prepend_masked_mean_token(

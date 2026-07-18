@@ -23,6 +23,7 @@ All optimizations are inference-only. Training code paths are untouched.
 | CUDA graph replay of condition encoding + duration prediction | CUDA only | exact (bit-identical vs eager) | `IRODORI_DISABLE_DURATION_GRAPH=1` |
 | fp16 codec decode (decoder-only, deterministic algorithms) | CUDA only | ~58-60 dB SNR vs fp32 (inaudible, deterministic) | `IRODORI_DISABLE_FP16_DECODE=1` |
 | Text-length bucketing (short texts padded to 64 instead of max_text_len) | all | ~41 dB SNR for short texts (inaudible, deterministic) | `IRODORI_TEXT_BUCKETS=0` |
+| torch.compile-fused kernels replayed inside the CUDA step graphs (opt-in) | CUDA + Triton (Linux/WSL2) | different sampling trajectory (judge by ear); deterministic | `IRODORI_COMPILE=1` to enable |
 | Prewarm also warms codec decoder + watermarker | CUDA only | none | (part of Prewarm) |
 | Latent-length bucketing (graphs shared across lengths) | CUDA only | ~47 dB SNR when padding occurs (inaudible, deterministic) | `IRODORI_CUDA_GRAPH_BUCKET=1` |
 | Graph prewarm (runtime API + Gradio button) | CUDA only | - | (button; opt-in) |
@@ -61,6 +62,7 @@ available for CUDA). CUDA graph replay removes that overhead.
 | `IRODORI_DISABLE_DURATION_GRAPH` | `0` | `1` keeps condition encoding + duration prediction eager (sampler graphs unaffected) |
 | `IRODORI_DISABLE_FP16_DECODE` | `0` | `1` keeps the codec decoder in fp32 (exact decode, ~2x slower) |
 | `IRODORI_TEXT_BUCKETS` | `64` | Comma-separated text-length buckets (tokens); short texts are padded to the smallest fitting bucket instead of max_text_len. `0` or empty disables (upstream padding) |
+| `IRODORI_COMPILE` | `0` | `1` runs the DiT through torch.compile and replays the fused kernels inside the CUDA step graphs. Requires a working Triton toolchain (Linux/WSL2 + C compiler); no effect on outputs' determinism, but the sampling trajectory changes |
 | `IRODORI_CUDA_GRAPH_BUCKET` | `16` | Latent-length bucket size in patched steps; `1` disables padding |
 | `IRODORI_CUDA_GRAPH_CACHE` | `64` | Max cached graph entries (per-entry VRAM is small; pool and condition buffers are shared) |
 
@@ -85,6 +87,37 @@ Setting `IRODORI_DISABLE_TF32=1`, `IRODORI_DISABLE_LORA_MERGE=1`,
   an fp32 encoder. Selecting bf16/fp16 codec precision is not faster and only
   lowers quality (bf16 decode measured ~42 dB), and it additionally moves the
   reference-audio *encoder* off fp32.
+
+## torch.compile (Linux / WSL2, opt-in)
+
+With `IRODORI_COMPILE=1`, `encode_conditions`, `build_context_kv_cache` and
+`forward_with_encoded_conditions` run through torch.compile, and the fused
+Triton kernels are replayed inside the existing CUDA step graphs: inductor's
+kernel fusion stacks with graph replay's zero launch overhead. Measured on
+the reference setup (bf16 model, WSL2): sample_rf ~169 -> ~105-117 ms,
+total_to_decode ~196 -> ~135-153 ms. Neither piece wins alone: compiled
+kernels without graph replay were *slower* than the eager graphs (fusion does
+not pay for the per-step launch overhead), and graphs without compile leave
+the fusion gains on the table.
+
+Requirements and behavior:
+
+- Needs a working Triton toolchain: Linux or WSL2, CUDA torch build, and a C
+  compiler (`apt-get install build-essential`). On Windows-native (no
+  Triton) leave it off; the flag only changes how kernels are generated, so
+  everything else in this document applies unchanged.
+- Compilation happens during Prewarm / the first request's warmup, never
+  inside a capture (capture-time recompiles invalidate the capture; the
+  runtime pre-builds the RoPE caches and avoids trace-unstable code paths to
+  guarantee this). Cold-cache Prewarm takes ~3.5 min; inductor's on-disk
+  cache cuts later processes to ~1 min.
+- Outputs change (fused kernels = different float schedule), like switching
+  model precision: same seed remains deterministic - verified bit-identical
+  across independent processes - but it is a different take than the
+  non-compiled output. Judge by ear.
+- LoRA loading/switching changes module structure and triggers a one-time
+  recompile absorbed by the next warmup/prewarm; hot-swap keeps structures
+  and does not recompile.
 
 ## Recommended Gradio Workflow
 
