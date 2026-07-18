@@ -1758,6 +1758,35 @@ class InferenceRuntime:
         if self.model_device.type == "cuda":
             torch.cuda.empty_cache()
 
+        # Warm the decode/watermark stages last (after empty_cache, so their
+        # working-set allocations survive into the first real request). The
+        # first decode/watermark calls otherwise pay one-time cuDNN plan and
+        # allocator-growth costs of ~40 ms each. Sized to the prewarmed
+        # duration range so shorter real requests fit within the warmed blocks.
+        with self._infer_lock, torch.inference_mode():
+            if self.codec.device.type == "cuda":
+                dummy_latent = torch.zeros(
+                    (1, int(max_frames), self.codec.latent_dim),
+                    device=self.codec.device,
+                    dtype=torch.float32,
+                )
+                self.codec.decode_latent(dummy_latent)
+                _log("[runtime] prewarm: warmed codec decoder")
+
+            if self.watermarker.ready:
+                # Deterministic dummy signal so global RNG state stays
+                # untouched.
+                try:
+                    sample_rate = int(self.codec.sample_rate)
+                    t = torch.arange(int(max_frames) * hop_length, dtype=torch.float32)
+                    dummy_audio = (0.1 * torch.sin(2.0 * math.pi * 440.0 * t / sample_rate))[
+                        None, :
+                    ]
+                    self.watermarker.encode_batch([dummy_audio], sample_rate=sample_rate)
+                    _log("[runtime] prewarm: warmed watermarker")
+                except Exception as exc:  # pragma: no cover - defensive
+                    _log(f"[runtime] prewarm: watermark warmup skipped ({exc!r})")
+
         elapsed = time.perf_counter() - t_start
         graph_count = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
         lora_note = self._last_lora_token if self._last_lora_token is not None else "__base__"

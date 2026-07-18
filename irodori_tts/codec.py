@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,9 @@ class DACVAECodec:
     deterministic_encode: bool
     deterministic_decode: bool
     normalize_db: float | None
+    # Dtype used for decode_latent. Differs from `dtype` only when the fp32
+    # decode path was converted to fp16 for speed (see load()).
+    decode_dtype: torch.dtype | None = None
 
     @classmethod
     def load(
@@ -99,6 +103,33 @@ class DACVAECodec:
             cls._configure_deterministic_decode(model=model, device=device)
 
         model_dtype = next(model.parameters()).dtype
+
+        # The DACVAE decoder is GPU-compute-bound (CUDA graphs and cuDNN
+        # autotuning gain nothing; measured in docs/performance.md), so the
+        # only effective speedup is reduced precision. Convert the
+        # decode-only modules (quantizer.out_proj + decoder) to fp16, keeping
+        # the encoder in fp32 so reference-audio encoding is unchanged.
+        # Halves decode time at ~60 dB SNR vs fp32 (inaudible; cleaner than
+        # the TF32 matmul change that is already on by default).
+        decode_dtype = model_dtype
+        if (
+            torch.device(device).type == "cuda"
+            and model_dtype == torch.float32
+            and os.environ.get("IRODORI_DISABLE_FP16_DECODE", "0").strip() != "1"
+        ):
+            decoder_mod = getattr(model, "decoder", None)
+            if decoder_mod is not None:
+                decoder_mod.half()
+                out_proj = getattr(getattr(model, "quantizer", None), "out_proj", None)
+                if out_proj is not None:
+                    out_proj.half()
+                decode_dtype = torch.float16
+                print(
+                    "[codec] decode path converted to fp16 (~2x faster decode; "
+                    "set IRODORI_DISABLE_FP16_DECODE=1 for exact fp32 decode)",
+                    flush=True,
+                )
+
         # Infer latent dimension by encoding a tiny random signal.
         dummy = torch.zeros(1, 1, 2048, device=device, dtype=model_dtype)
         with torch.inference_mode():
@@ -112,6 +143,7 @@ class DACVAECodec:
             deterministic_encode=bool(deterministic_encode),
             deterministic_decode=bool(deterministic_decode),
             normalize_db=None if normalize_db is None else float(normalize_db),
+            decode_dtype=decode_dtype,
         )
 
     @staticmethod
@@ -263,8 +295,22 @@ class DACVAECodec:
         """
         if latent.ndim != 3:
             raise ValueError(f"Expected latent ndim=3, got shape={tuple(latent.shape)}")
-        z = latent.transpose(1, 2).contiguous().to(self.device, dtype=self.dtype)  # (B, D, T)
-        return self.model.decode(z)
+        decode_dtype = self.dtype if self.decode_dtype is None else self.decode_dtype
+        z = latent.transpose(1, 2).contiguous().to(self.device, dtype=decode_dtype)  # (B, D, T)
+        if self.device.type == "cuda" and decode_dtype in (torch.float16, torch.bfloat16):
+            # Half-precision cuDNN autoselect can pick nondeterministic conv
+            # kernels, so the same latent would not always decode to the same
+            # audio. Force deterministic algorithms for the decode call; it is
+            # not measurably slower here.
+            prev_deterministic = torch.backends.cudnn.deterministic
+            torch.backends.cudnn.deterministic = True
+            try:
+                audio = self.model.decode(z)
+            finally:
+                torch.backends.cudnn.deterministic = prev_deterministic
+        else:
+            audio = self.model.decode(z)
+        return audio.to(dtype=self.dtype)
 
     def encode_file(self, path: str | Path) -> torch.Tensor:
         try:
