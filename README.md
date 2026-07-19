@@ -480,6 +480,25 @@ base checkpoint is needed: only adapter tensors are read and written.
   `irodori_lora_metadata.json`, and the merged adapter is reloaded after writing to
   verify it is usable (disable with `--skip-verify`).
 
+Which adapters can be merged:
+
+- **Required — same base weights.** All adapters must be trained from the same base
+  checkpoint (e.g. all from the v3 base release). Adapters from different base
+  checkpoints cannot be blended meaningfully; the script warns when the recorded base
+  paths differ.
+- **Required — same `modules_to_save` and plain LoRA.** Adapters must agree on their
+  fully saved modules (the duration predictor for the v3 LoRA config), and DoRA
+  adapters are rejected. Keep `lora_bias: none`.
+- **Not required — equal rank.** The default `cat` combination (and `svd`) merges
+  adapters of different ranks; only `linear` requires equal ranks.
+- **Irrelevant — training hyperparameters.** `lora_alpha` (its scaling is folded into
+  the merge), learning rate, step count, batch size, dropout, seed, and dataset size
+  do not need to match.
+- **Quality tips.** Prefer adapters trained with the same `lora_target_modules` preset
+  (mismatches merge over the union, with a warning), and merge best-validation
+  checkpoints rather than heavily overtrained ones — blending assumes the adapters'
+  deltas are small, and large deltas mix less predictably.
+
 #### Speaker Inversion
 
 Speaker Inversion trains only a small set of speaker embedding tokens while keeping the
