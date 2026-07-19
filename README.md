@@ -452,6 +452,34 @@ and initialize from `Irodori-TTS-500M-v2-VoiceDesign.safetensors`.
 LoRA target presets, adapter saving behavior, and resume details are covered in the
 [Parameter Guide](docs/parameters.md).
 
+#### Merging LoRA Adapters (Voice Blending)
+
+`merge_lora_adapters.py` combines two or more adapter checkpoints trained on the same
+base model into a single adapter directory, e.g. to blend two speaker voices:
+
+```bash
+uv run --no-sync python merge_lora_adapters.py \
+  --adapter outputs/lora_speaker_a/checkpoint_best_val_loss_0002000_0.490503 \
+  --adapter outputs/lora_speaker_b/checkpoint_best_val_loss_0010000_0.714947 \
+  --weights 0.7 0.3 \
+  --output-dir outputs/lora_speaker_mix
+```
+
+The output has the same layout as a training adapter checkpoint and can be passed
+directly to `infer.py --lora-adapter` or the server's per-request adapter field. No
+base checkpoint is needed: only adapter tensors are read and written.
+
+- LoRA weights are merged with PEFT's `add_weighted_adapter`. The default
+  `--combination-type cat` concatenates ranks and reproduces the weighted sum of the
+  source deltas exactly (merged rank = sum of source ranks); `linear` keeps the source
+  rank but is approximate; `svd` re-decomposes at `--svd-rank`.
+- Fully saved modules (`modules_to_save`, i.e. the duration predictor for the v3 LoRA
+  config) are not low-rank deltas, so they are replaced with a weighted average of the
+  source copies using weights normalized to sum to 1.
+- Provenance (source adapters, weights, combination type) is recorded in the output's
+  `irodori_lora_metadata.json`, and the merged adapter is reloaded after writing to
+  verify it is usable (disable with `--skip-verify`).
+
 #### Speaker Inversion
 
 Speaker Inversion trains only a small set of speaker embedding tokens while keeping the
