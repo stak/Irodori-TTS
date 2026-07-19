@@ -9,12 +9,29 @@ from .model import TextToLatentRFDiT
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
 
 
-def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.device]:
-    # MPS generators are not available on some PyTorch builds; use CPU generator as fallback.
+def _make_rngs(
+    seed: int, batch_size: int, device: torch.device
+) -> tuple[list[torch.Generator], torch.device]:
+    # One generator per batch row, seeded seed + i. Row i's noise is drawn as
+    # its own (1, ...) tensor from generator i, so a single-candidate rerun
+    # with seed + i draws the identical noise regardless of the original
+    # batch size. A single batched draw would not have this property: CUDA's
+    # Philox generator assigns values to elements based on the full tensor
+    # shape, so row i of an N-row draw cannot be reproduced by any seed alone.
+    # MPS generators are not available on some PyTorch builds; use CPU
+    # generators as fallback.
     try:
-        return torch.Generator(device=device).manual_seed(seed), device
+        rngs = [
+            torch.Generator(device=device).manual_seed(seed + index)
+            for index in range(batch_size)
+        ]
+        return rngs, device
     except RuntimeError:
-        return torch.Generator(device="cpu").manual_seed(seed), torch.device("cpu")
+        rngs = [
+            torch.Generator(device="cpu").manual_seed(seed + index)
+            for index in range(batch_size)
+        ]
+        return rngs, torch.device("cpu")
 
 
 def sample_logit_normal_t(
@@ -213,9 +230,18 @@ def sample_euler_rf_cfg(
     batch_size = text_input_ids.shape[0]
     latent_dim = model.cfg.patched_latent_dim
 
-    rng, rng_device = _make_rng(seed=seed, device=device)
-    x_t = torch.randn(
-        (batch_size, sequence_length, latent_dim), device=rng_device, dtype=dtype, generator=rng
+    rngs, rng_device = _make_rngs(seed=seed, batch_size=batch_size, device=device)
+    x_t = torch.cat(
+        [
+            torch.randn(
+                (1, sequence_length, latent_dim),
+                device=rng_device,
+                dtype=dtype,
+                generator=rng,
+            )
+            for rng in rngs
+        ],
+        dim=0,
     )
     if rng_device != device:
         x_t = x_t.to(device=device)
@@ -301,11 +327,20 @@ def sample_euler_rf_cfg(
                 "Speaker conditioning is enabled but encoded speaker state is missing."
             )
         if speaker_uncond_mode == "noise":
-            speaker_noise = torch.randn(
-                speaker_state_cond.shape,
-                device=rng_device,
-                dtype=speaker_state_cond.dtype,
-                generator=rng,
+            # Drawn per candidate from the same generators as x_t (row i is
+            # generator i's second draw) so each candidate's noise stream
+            # stays reproducible from seed + i alone.
+            speaker_noise = torch.cat(
+                [
+                    torch.randn(
+                        (1, *speaker_state_cond.shape[1:]),
+                        device=rng_device,
+                        dtype=speaker_state_cond.dtype,
+                        generator=rng,
+                    )
+                    for rng in rngs
+                ],
+                dim=0,
             )
             if rng_device != device:
                 speaker_noise = speaker_noise.to(device=device)
