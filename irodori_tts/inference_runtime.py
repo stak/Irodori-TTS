@@ -269,6 +269,12 @@ class SamplingRequest:
     ref_latent: str | None = None
     ref_embed: str | None = None
     no_ref: bool = False
+    # In-memory alternative to ref_wav: a float waveform of shape (samples,)
+    # or (channels, samples). Requires ref_audio_sample_rate and is processed
+    # identically to ref_wav (max_ref_seconds trim, loudness normalize, codec
+    # encode). Cannot be combined with ref_wav/ref_latent/ref_embed.
+    ref_audio: torch.Tensor | None = None
+    ref_audio_sample_rate: int | None = None
     ref_normalize_db: float | None = -16.0
     ref_ensure_max: bool = True
     num_candidates: int = 1
@@ -910,7 +916,7 @@ class InferenceRuntime:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
         if not self.model_cfg.use_speaker_condition_resolved:
-            if req.ref_wav is not None or req.ref_latent is not None:
+            if req.ref_wav is not None or req.ref_latent is not None or req.ref_audio is not None:
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
                 )
@@ -931,8 +937,10 @@ class InferenceRuntime:
             )
             return ref_latent_patched, ref_mask
 
-        if req.ref_wav is None and req.ref_latent is None:
-            raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
+        if req.ref_wav is None and req.ref_latent is None and req.ref_audio is None:
+            raise ValueError("Specify ref_wav, ref_latent or ref_audio, or set no_ref=True.")
+        if req.ref_audio is not None and (req.ref_wav is not None or req.ref_latent is not None):
+            raise ValueError("ref_audio cannot be combined with ref_wav/ref_latent.")
 
         max_ref_latent_steps = None
         if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
@@ -952,7 +960,10 @@ class InferenceRuntime:
             ).unsqueeze(0)
             ref_latent = ref_latent.to(dtype=runtime_dtype)
         else:
-            wav, sr = _load_audio(req.ref_wav)
+            if req.ref_audio is not None:
+                wav, sr = _coerce_reference_audio(req.ref_audio, req.ref_audio_sample_rate)
+            else:
+                wav, sr = _load_audio(req.ref_wav)
             if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
                 max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
                 if wav.shape[1] > max_ref_samples:
@@ -1015,10 +1026,15 @@ class InferenceRuntime:
                 "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
             )
             return None, None
-        if req.ref_wav is not None or req.ref_latent is not None or req.no_ref:
+        if (
+            req.ref_wav is not None
+            or req.ref_latent is not None
+            or req.ref_audio is not None
+            or req.no_ref
+        ):
             raise ValueError(
-                "ref_embed/--ref-embed cannot be combined with ref_wav/ref_latent/no_ref. "
-                "Use exactly one speaker conditioning source."
+                "ref_embed/--ref-embed cannot be combined with ref_wav/ref_latent/ref_audio/"
+                "no_ref. Use exactly one speaker conditioning source."
             )
 
         runtime_dtype = next(self.model.parameters()).dtype
@@ -1961,6 +1977,27 @@ def clear_cached_runtime() -> None:
 
     if runtime is not None:
         runtime.unload()
+
+
+def _coerce_reference_audio(
+    audio: torch.Tensor,
+    sample_rate: int | None,
+) -> tuple[torch.Tensor, int]:
+    if not isinstance(audio, torch.Tensor):
+        raise ValueError("ref_audio must be a torch.Tensor waveform.")
+    if sample_rate is None or int(sample_rate) <= 0:
+        raise ValueError("ref_audio requires a positive ref_audio_sample_rate.")
+    wav = audio.detach().to(device="cpu", dtype=torch.float32)
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    if wav.ndim != 2:
+        raise ValueError(
+            "ref_audio must have shape (samples,) or (channels, samples), "
+            f"got {tuple(audio.shape)}"
+        )
+    if wav.shape[1] == 0:
+        raise ValueError("ref_audio must contain at least one sample.")
+    return wav.contiguous(), int(sample_rate)
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
