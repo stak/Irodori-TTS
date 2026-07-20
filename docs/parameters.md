@@ -85,7 +85,7 @@ by `--duration-scale`. If it does not, the runtime falls back to 30 seconds.
 | `--sway-coeff` | `-1.0` | Sway Sampling coefficient. Negative values allocate more schedule resolution to the noise side. |
 | `--num-candidates` | `1` | Number of candidates generated in one batched sampling pass. Higher values increase VRAM use. |
 | `--decode-mode` | `sequential` | `sequential` decodes candidates one by one and uses less VRAM. `batch` decodes all candidates together and can be faster. |
-| `--seed` | random | Sampling seed. Set it for reproducible results with the same checkpoint and parameters. |
+| `--seed` | random | Sampling seed. Set it for reproducible results with the same checkpoint and parameters. With `--num-candidates N`, candidate `i` draws its noise from `seed + i` (reported per file in the CLI output), so a candidate can be regenerated alone with `--num-candidates 1 --seed <seed+i>`. On CUDA the standalone rerun is numerically close but not bit-exact against the batched run (kernel numerics differ across batch sizes); bit-exact reproduction needs the same seed and the same candidate count. |
 | `--truncation-factor` | `None` | Scales the initial Gaussian noise before sampling. Values such as `0.8` or `0.9` can reduce variation, but may also reduce expressiveness. |
 | `--rescale-k` / `--rescale-sigma` | `None` | Temporal score rescaling parameters. Set both together or leave both unset. |
 

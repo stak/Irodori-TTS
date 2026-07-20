@@ -478,10 +478,13 @@ def main() -> None:
     else:
         base_path = Path(str(args.output_wav))
         suffix = base_path.suffix if base_path.suffix else ".wav"
+        used_seeds = result.used_seeds or [
+            result.used_seed + index for index in range(len(result.audios))
+        ]
         for i, audio in enumerate(result.audios, start=1):
             out_path = base_path.with_name(f"{base_path.stem}_{i:03d}{suffix}")
             saved = save_wav(out_path, audio, result.sample_rate)
-            print(f"Saved[{i}]: {saved}")
+            print(f"Saved[{i}]: {saved} (seed={used_seeds[i - 1]})")
     if args.show_timings:
         _print_timings(result.stage_timings, result.total_to_decode)
 

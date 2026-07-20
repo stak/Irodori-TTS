@@ -323,6 +323,10 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+    # Per-candidate seeds: candidate i was drawn with used_seed + i, so any
+    # candidate can be regenerated alone with num_candidates=1 and its seed.
+    # Optional so existing constructors keep working; synthesize always fills it.
+    used_seeds: list[int] | None = None
 
 
 def _maybe_compile_inference_model(
@@ -1380,6 +1384,15 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
+        used_seeds = [used_seed + index for index in range(num_candidates)]
+        if num_candidates > 1:
+            msg = (
+                f"info: candidate seeds {used_seeds[0]}..{used_seeds[-1]} "
+                "(candidate i uses seed + i and can be regenerated alone with "
+                "num_candidates=1)."
+            )
+            messages.append(msg)
+            _log(msg)
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
         with (
@@ -1677,6 +1690,7 @@ class InferenceRuntime:
             total_to_decode=total_to_decode,
             used_seed=used_seed,
             messages=messages,
+            used_seeds=used_seeds,
         )
 
     def prewarm_cuda_graphs(
