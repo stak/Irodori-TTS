@@ -499,6 +499,27 @@ Which adapters can be merged:
   checkpoints rather than heavily overtrained ones — blending assumes the adapters'
   deltas are small, and large deltas mix less predictably.
 
+#### Blending Speaker Inversion Embeddings
+
+`blend_speaker_embeddings.py` blends two or more Speaker Inversion checkpoints into a
+single embedding, e.g. to create an intermediate voice between two learned speakers:
+
+```bash
+uv run --no-sync python blend_speaker_embeddings.py \
+  --embed outputs/speaker_inversion/a/checkpoint_best_val_loss_0002400_0.696416.speaker.safetensors \
+  --embed outputs/speaker_inversion/b/checkpoint_best_val_loss_0002600_0.684481.speaker.safetensors \
+  --weights 0.5 0.5 \
+  --output outputs/speaker_inversion/ab_mix.speaker.safetensors
+```
+
+The output is a standard `.speaker.safetensors` usable with `--ref-embed`, and blend
+provenance is written to `<output>.blend.json`. The default `--mode lerp` (weighted
+mean; requires equal token counts across sources) usually interpolates cleanly because
+the base model's speaker manifold was trained across many speakers; if a blend sounds
+muddy, try the experimental `--mode concat`, which concatenates the token sequences
+instead of assuming token-slot correspondence. Embeddings blend meaningfully only when
+trained against the same base checkpoint.
+
 #### Speaker Inversion
 
 Speaker Inversion trains only a small set of speaker embedding tokens while keeping the
