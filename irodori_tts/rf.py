@@ -738,6 +738,38 @@ def sample_euler_rf_cfg(
             return []
         return [tensor for layer in kv for tensor in layer]
 
+    # Later same-shape requests overwrite the adopted static buffers in place
+    # (static_buf.copy_ below), which is illegal for aliased views - e.g. a
+    # speaker-inversion embedding expanded across candidates has stride 0 in
+    # the batch dimension ("more than one element of the written-to tensor
+    # refers to a single memory location"). Give every condition tensor its
+    # own storage before it can be adopted or captured.
+    def _own_storage(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None or tensor.is_contiguous():
+            return tensor
+        return tensor.contiguous()
+
+    independent_text_state = _own_storage(independent_text_state)
+    independent_text_mask = _own_storage(independent_text_mask)
+    independent_speaker_state = _own_storage(independent_speaker_state)
+    independent_speaker_mask = _own_storage(independent_speaker_mask)
+    independent_caption_state = _own_storage(independent_caption_state)
+    independent_caption_mask = _own_storage(independent_caption_mask)
+    text_state_cond = _own_storage(text_state_cond)
+    text_mask_cond = _own_storage(text_mask_cond)
+    speaker_state_cond = _own_storage(speaker_state_cond)
+    speaker_mask_cond = _own_storage(speaker_mask_cond)
+    caption_state_cond = _own_storage(caption_state_cond)
+    caption_mask_cond = _own_storage(caption_mask_cond)
+    if context_kv_cfg is not None:
+        context_kv_cfg = [
+            tuple(_own_storage(tensor) for tensor in layer) for layer in context_kv_cfg
+        ]
+    if context_kv_cond is not None:
+        context_kv_cond = [
+            tuple(_own_storage(tensor) for tensor in layer) for layer in context_kv_cond
+        ]
+
     # Condition tensors (text/speaker/caption states and projected KV caches) do
     # not depend on the latent length, so a single shared set of static buffers
     # serves every captured graph. VRAM therefore does not grow with the number
