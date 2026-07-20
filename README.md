@@ -452,6 +452,74 @@ and initialize from `Irodori-TTS-500M-v2-VoiceDesign.safetensors`.
 LoRA target presets, adapter saving behavior, and resume details are covered in the
 [Parameter Guide](docs/parameters.md).
 
+#### Merging LoRA Adapters (Voice Blending)
+
+`merge_lora_adapters.py` combines two or more adapter checkpoints trained on the same
+base model into a single adapter directory, e.g. to blend two speaker voices:
+
+```bash
+uv run --no-sync python merge_lora_adapters.py \
+  --adapter outputs/lora_speaker_a/checkpoint_best_val_loss_0002000_0.490503 \
+  --adapter outputs/lora_speaker_b/checkpoint_best_val_loss_0010000_0.714947 \
+  --weights 0.7 0.3 \
+  --output-dir outputs/lora_speaker_mix
+```
+
+The output has the same layout as a training adapter checkpoint and can be passed
+directly to `infer.py --lora-adapter` or the server's per-request adapter field. No
+base checkpoint is needed: only adapter tensors are read and written.
+
+- LoRA weights are merged with PEFT's `add_weighted_adapter`. The default
+  `--combination-type cat` concatenates ranks and reproduces the weighted sum of the
+  source deltas exactly (merged rank = sum of source ranks); `linear` keeps the source
+  rank but is approximate; `svd` re-decomposes at `--svd-rank`.
+- Fully saved modules (`modules_to_save`, i.e. the duration predictor for the v3 LoRA
+  config) are not low-rank deltas, so they are replaced with a weighted average of the
+  source copies using weights normalized to sum to 1.
+- Provenance (source adapters, weights, combination type) is recorded in the output's
+  `irodori_lora_metadata.json`, and the merged adapter is reloaded after writing to
+  verify it is usable (disable with `--skip-verify`).
+
+Which adapters can be merged:
+
+- **Required — same base weights.** All adapters must be trained from the same base
+  checkpoint (e.g. all from the v3 base release). Adapters from different base
+  checkpoints cannot be blended meaningfully; the script warns when the recorded base
+  paths differ.
+- **Required — same `modules_to_save` and plain LoRA.** Adapters must agree on their
+  fully saved modules (the duration predictor for the v3 LoRA config), and DoRA
+  adapters are rejected. Keep `lora_bias: none`.
+- **Not required — equal rank.** The default `cat` combination (and `svd`) merges
+  adapters of different ranks; only `linear` requires equal ranks.
+- **Irrelevant — training hyperparameters.** `lora_alpha` (its scaling is folded into
+  the merge), learning rate, step count, batch size, dropout, seed, and dataset size
+  do not need to match.
+- **Quality tips.** Prefer adapters trained with the same `lora_target_modules` preset
+  (mismatches merge over the union, with a warning), and merge best-validation
+  checkpoints rather than heavily overtrained ones — blending assumes the adapters'
+  deltas are small, and large deltas mix less predictably.
+
+#### Blending Speaker Inversion Embeddings
+
+`blend_speaker_embeddings.py` blends two or more Speaker Inversion checkpoints into a
+single embedding, e.g. to create an intermediate voice between two learned speakers:
+
+```bash
+uv run --no-sync python blend_speaker_embeddings.py \
+  --embed outputs/speaker_inversion/a/checkpoint_best_val_loss_0002400_0.696416.speaker.safetensors \
+  --embed outputs/speaker_inversion/b/checkpoint_best_val_loss_0002600_0.684481.speaker.safetensors \
+  --weights 0.5 0.5 \
+  --output outputs/speaker_inversion/ab_mix.speaker.safetensors
+```
+
+The output is a standard `.speaker.safetensors` usable with `--ref-embed`, and blend
+provenance is written to `<output>.blend.json`. The default `--mode lerp` (weighted
+mean; requires equal token counts across sources) usually interpolates cleanly because
+the base model's speaker manifold was trained across many speakers; if a blend sounds
+muddy, try the experimental `--mode concat`, which concatenates the token sequences
+instead of assuming token-slot correspondence. Embeddings blend meaningfully only when
+trained against the same base checkpoint.
+
 #### Speaker Inversion
 
 Speaker Inversion trains only a small set of speaker embedding tokens while keeping the
