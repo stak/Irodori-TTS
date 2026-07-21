@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
 from huggingface_hub import hf_hub_download
 
+from irodori_tts import perf_profile
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
     RuntimeKey,
@@ -156,12 +158,17 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     if suffix in {".pt", ".safetensors"}:
         return checkpoint
 
-    try:
-        # Prefer the local HF cache to avoid a network round-trip on every click.
-        resolved = hf_hub_download(
-            repo_id=checkpoint, filename="model.safetensors", local_files_only=True
-        )
-    except Exception:
+    if os.environ.get("IRODORI_OFFLINE_FIRST_CHECKPOINT", "0").strip() == "1":
+        # Opt-in: prefer the local HF cache to avoid a network round-trip on
+        # every click. Note that a newer model.safetensors published upstream
+        # is then not picked up while a cached copy exists.
+        try:
+            resolved = hf_hub_download(
+                repo_id=checkpoint, filename="model.safetensors", local_files_only=True
+            )
+        except Exception:
+            resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
+    else:
         resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
     print(f"[gradio] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
     return str(resolved)
@@ -406,6 +413,12 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("# Irodori-TTS Inference (Cached Runtime)")
         gr.Markdown(
             "When settings are unchanged, runtime is reused and only sampling/decoding runs."
+        )
+        gr.Markdown(
+            f"Performance profile: **{perf_profile.profile_name()}** — set "
+            "`IRODORI_PERF_PROFILE=recommended` before launch for the fork's "
+            "speed optimizations (`upstream`, the default, matches unmodified "
+            "Irodori-TTS output exactly). See docs/performance.md."
         )
 
         with gr.Row():

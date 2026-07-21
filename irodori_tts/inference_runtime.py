@@ -19,6 +19,7 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
+from . import perf_profile
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
@@ -113,12 +114,13 @@ def _enable_cuda_fast_math() -> None:
     """
     Allow TF32 tensor-core execution for fp32 matmuls/convolutions and enable
     cuDNN autotuning. Gives a large speedup on Ampere+ GPUs with negligible
-    numerical impact. Opt out with IRODORI_DISABLE_TF32=1.
+    numerical impact. On under IRODORI_PERF_PROFILE=recommended; override
+    with IRODORI_DISABLE_TF32.
     """
     global _FAST_MATH_CONFIGURED
     if _FAST_MATH_CONFIGURED:
         return
-    if os.environ.get("IRODORI_DISABLE_TF32", "0").strip() == "1":
+    if not perf_profile.optimization_enabled("IRODORI_DISABLE_TF32"):
         _FAST_MATH_CONFIGURED = True
         return
     # TF32 for matmuls only. Empirically, forcing TF32/cudnn-benchmark on the
@@ -143,9 +145,10 @@ def _text_bucket_lengths() -> list[int]:
     bucket that fits instead of the checkpoint's full max_text_len, shrinking
     the per-step cross-attention over masked padding keys. Comma-separated in
     IRODORI_TEXT_BUCKETS; empty or "0" disables bucketing (always pad to
-    max_text_len, the upstream behavior).
+    max_text_len, the upstream behavior). Unset, the profile decides
+    (recommended: 64, upstream: disabled).
     """
-    raw = os.environ.get("IRODORI_TEXT_BUCKETS", "64").strip()
+    raw = perf_profile.text_buckets_raw()
     if raw in {"", "0"}:
         return []
     lengths = []
@@ -754,8 +757,8 @@ class InferenceRuntime:
         used inside the graph is replaced wholesale (modules_to_save) and the
         previous adapter was actually merged.
         """
-        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
-            return False, "LoRA merge is disabled (IRODORI_DISABLE_LORA_MERGE=1)"
+        if not perf_profile.optimization_enabled("IRODORI_DISABLE_LORA_MERGE"):
+            return False, "LoRA merge is disabled (profile or IRODORI_DISABLE_LORA_MERGE)"
         if (
             self._last_lora_token not in (None, "__base__")
             and self._merged_lora_path != self._last_lora_token
@@ -891,7 +894,7 @@ class InferenceRuntime:
         extra low-rank matmuls on every forward pass. Mathematically equivalent
         (up to float rounding) to running with an unmerged adapter.
         """
-        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
+        if not perf_profile.optimization_enabled("IRODORI_DISABLE_LORA_MERGE"):
             return
         merge_adapter = getattr(self.model, "merge_adapter", None)
         if not callable(merge_adapter):
@@ -1138,8 +1141,8 @@ class InferenceRuntime:
             graph_eligible
             and speaker_state_override is None
             and self.model_device.type == "cuda"
-            and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
-            and os.environ.get("IRODORI_DISABLE_DURATION_GRAPH", "0").strip() != "1"
+            and perf_profile.optimization_enabled("IRODORI_DISABLE_CUDA_GRAPH")
+            and perf_profile.optimization_enabled("IRODORI_DISABLE_DURATION_GRAPH")
             and not self._cuda_graph_cache.get("__duration_disabled__", False)
         )
         if not graph_supported:

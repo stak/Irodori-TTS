@@ -5,6 +5,7 @@ import os
 
 import torch
 
+from . import perf_profile
 from .model import TextToLatentRFDiT
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
 
@@ -708,7 +709,7 @@ def sample_euler_rf_cfg(
         and cfg_guidance_mode == "independent"
         and rescale_k is None
         and speaker_kv_scale is None
-        and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
+        and perf_profile.optimization_enabled("IRODORI_DISABLE_CUDA_GRAPH")
         and not cuda_graph_cache.get("__disabled__", False)
     )
     if not graph_supported:

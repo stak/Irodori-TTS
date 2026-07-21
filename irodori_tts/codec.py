@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +7,8 @@ from pathlib import Path
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
+
+from . import perf_profile
 
 _CODEC_DEFAULT = object()
 
@@ -115,7 +116,7 @@ class DACVAECodec:
         if (
             torch.device(device).type == "cuda"
             and model_dtype == torch.float32
-            and os.environ.get("IRODORI_DISABLE_FP16_DECODE", "0").strip() != "1"
+            and perf_profile.optimization_enabled("IRODORI_DISABLE_FP16_DECODE")
         ):
             decoder_mod = getattr(model, "decoder", None)
             if decoder_mod is not None:
