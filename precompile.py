@@ -97,9 +97,10 @@ def main() -> None:
         "--lora-adapter",
         default=None,
         help=(
-            "Optional PEFT LoRA adapter directory. Load one whenever production "
-            "serves LoRA requests, so compilation sees the PEFT-wrapped module "
-            "structure."
+            "Optional comma-separated PEFT LoRA adapter directories. Pass every "
+            "adapter production will serve: compile cache entries are stored per "
+            "adapter, so an adapter that was never precompiled pays a cold "
+            "compile (~40 s measured) on its first load."
         ),
     )
     parser.add_argument(
@@ -185,7 +186,15 @@ def main() -> None:
     max_padded = ((max_patched + bucket - 1) // bucket) * bucket
     padded_lengths = list(range(bucket, max_padded + 1, bucket))
 
-    def synthesize(text: str, *, num_candidates: int, seconds: float | None) -> None:
+    adapters: list[str | None] = (
+        [None]
+        if args.lora_adapter is None
+        else [part.strip() for part in str(args.lora_adapter).split(",") if part.strip()]
+    )
+
+    def synthesize(
+        text: str, *, adapter: str | None, num_candidates: int, seconds: float | None
+    ) -> None:
         runtime.synthesize(
             SamplingRequest(
                 text=text,
@@ -201,38 +210,48 @@ def main() -> None:
                 max_seconds=float(args.max_seconds),
                 cfg_scale_text=float(args.cfg_scale_text),
                 cfg_scale_speaker=float(args.cfg_scale_speaker),
-                lora_adapter=args.lora_adapter,
+                lora_adapter=adapter,
+                lora_hot_swap=True,
             ),
             log_fn=None,
         )
 
     t_start = time.perf_counter()
     covered = 0
-    for num_candidates in args.num_candidates:
-        for label, text in (("short", SHORT_TEXT), ("long", LONG_TEXT)):
-            # One duration-predicted request per (n, text bucket) exercises the
-            # exact production path for condition encoding + duration
-            # prediction (and its CUDA graph capture).
-            t0 = time.perf_counter()
-            synthesize(text, num_candidates=num_candidates, seconds=None)
-            covered += 1
-            print(
-                f"[precompile] n={num_candidates} text={label} duration=auto: "
-                f"{time.perf_counter() - t0:.1f}s",
-                flush=True,
-            )
-            for padded in padded_lengths:
-                # A seconds value just below the padded frame count lands the
-                # request exactly in this latent bucket.
-                seconds = (padded * patch_size - 0.5) * hop_length / sample_rate
+    for adapter in adapters:
+        adapter_label = adapter or "base"
+        for num_candidates in args.num_candidates:
+            for label, text in (("short", SHORT_TEXT), ("long", LONG_TEXT)):
+                # One duration-predicted request per (n, text bucket) exercises
+                # the exact production path for condition encoding + duration
+                # prediction (and its CUDA graph capture).
                 t0 = time.perf_counter()
-                synthesize(text, num_candidates=num_candidates, seconds=seconds)
+                synthesize(
+                    text, adapter=adapter, num_candidates=num_candidates, seconds=None
+                )
                 covered += 1
                 print(
-                    f"[precompile] n={num_candidates} text={label} "
-                    f"latent={padded}: {time.perf_counter() - t0:.1f}s",
+                    f"[precompile] adapter={adapter_label} n={num_candidates} "
+                    f"text={label} duration=auto: {time.perf_counter() - t0:.1f}s",
                     flush=True,
                 )
+                for padded in padded_lengths:
+                    # A seconds value just below the padded frame count lands
+                    # the request exactly in this latent bucket.
+                    seconds = (padded * patch_size - 0.5) * hop_length / sample_rate
+                    t0 = time.perf_counter()
+                    synthesize(
+                        text,
+                        adapter=adapter,
+                        num_candidates=num_candidates,
+                        seconds=seconds,
+                    )
+                    covered += 1
+                    print(
+                        f"[precompile] adapter={adapter_label} n={num_candidates} "
+                        f"text={label} latent={padded}: {time.perf_counter() - t0:.1f}s",
+                        flush=True,
+                    )
 
     elapsed = time.perf_counter() - t_start
     device_name = (
@@ -244,9 +263,10 @@ def main() -> None:
         "\n".join(
             [
                 f"[precompile] done: {covered} shapes in {elapsed:.1f}s",
-                f"[precompile] grid: n={args.num_candidates} x text buckets (short/long) "
-                f"x {len(padded_lengths)} latent buckets (<= {float(args.max_seconds):.1f}s, "
-                f"bucket={bucket}) + duration-auto per text bucket",
+                f"[precompile] grid: {len(adapters)} adapter(s) x n={args.num_candidates} "
+                f"x text buckets (short/long) x {len(padded_lengths)} latent buckets "
+                f"(<= {float(args.max_seconds):.1f}s, bucket={bucket}) "
+                "+ duration-auto per text bucket",
                 f"[precompile] environment: torch={torch.__version__} "
                 f"cuda={torch.version.cuda} device={device_name} "
                 f"model_precision={args.model_precision} "
