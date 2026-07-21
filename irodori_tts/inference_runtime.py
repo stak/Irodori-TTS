@@ -144,8 +144,8 @@ def _text_bucket_lengths() -> list[int]:
     Text-length buckets (in tokens). Short texts are padded to the smallest
     bucket that fits instead of the checkpoint's full max_text_len, shrinking
     the per-step cross-attention over masked padding keys. Comma-separated in
-    IRODORI_TEXT_BUCKETS; empty or "0" disables bucketing (always pad to
-    max_text_len, the upstream behavior). Unset, the profile decides
+    IRODORI_TEXT_BUCKETS; "0" disables bucketing (always pad to max_text_len,
+    the upstream behavior). Unset or empty, the profile decides
     (recommended: 64, upstream: disabled).
     """
     raw = perf_profile.text_buckets_raw()

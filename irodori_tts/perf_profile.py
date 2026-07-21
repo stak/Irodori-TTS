@@ -14,7 +14,9 @@ The individual environment variables always take precedence over the profile,
 in both directions: ``IRODORI_DISABLE_TF32=1`` forces TF32 off under
 ``recommended``, and ``IRODORI_DISABLE_TF32=0`` forces it on under
 ``upstream``. ``IRODORI_TEXT_BUCKETS`` overrides the bucket list the same way
-(``0`` or empty-after-set disables bucketing).
+(``0`` disables bucketing). An empty string is treated as unset for every
+variable, so container setups can pass through optional overrides
+(``${IRODORI_DISABLE_TF32:-}``) without pinning a value.
 
 ``IRODORI_COMPILE`` (torch.compile) is a separate opt-in - it requires a
 Triton toolchain - and is intentionally not part of any profile.
@@ -52,9 +54,11 @@ def optimization_enabled(disable_env: str) -> bool:
 
 def text_buckets_raw() -> str:
     """
-    The effective IRODORI_TEXT_BUCKETS value: the variable itself when set,
-    otherwise the profile default ("64" recommended / "0" upstream).
+    The effective IRODORI_TEXT_BUCKETS value: the variable itself when set
+    to a non-empty string, otherwise the profile default ("64" recommended /
+    "0" upstream).
     """
-    if "IRODORI_TEXT_BUCKETS" in os.environ:
-        return os.environ["IRODORI_TEXT_BUCKETS"].strip()
+    raw = os.environ.get("IRODORI_TEXT_BUCKETS", "").strip()
+    if raw != "":
+        return raw
     return "64" if profile_name() == "recommended" else "0"

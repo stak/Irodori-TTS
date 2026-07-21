@@ -85,7 +85,7 @@ kernels themselves (see [torch.compile](#torchcompile-linux--wsl2-opt-in)).
 | `IRODORI_DISABLE_CUDA_GRAPH` | (profile) | `1` disables graph capture/replay entirely, `0` forces it on |
 | `IRODORI_DISABLE_DURATION_GRAPH` | (profile) | `1` keeps condition encoding + duration prediction eager (sampler graphs unaffected), `0` forces the graph on |
 | `IRODORI_DISABLE_FP16_DECODE` | (profile) | `1` keeps the codec decoder in fp32 (exact decode, ~2x slower), `0` forces fp16 decode |
-| `IRODORI_TEXT_BUCKETS` | (profile: `64` / `0`) | Comma-separated text-length buckets (tokens); short texts are padded to the smallest fitting bucket instead of max_text_len. `0` or empty disables (upstream padding) |
+| `IRODORI_TEXT_BUCKETS` | (profile: `64` / `0`) | Comma-separated text-length buckets (tokens); short texts are padded to the smallest fitting bucket instead of max_text_len. `0` disables (upstream padding); empty is treated as unset |
 | `IRODORI_COMPILE` | `0` | `1` runs the DiT through torch.compile and replays the fused kernels inside the CUDA step graphs. Requires a working Triton toolchain (Linux/WSL2 + C compiler); no effect on outputs' determinism, but the sampling trajectory changes |
 | `IRODORI_CUDA_GRAPH_BUCKET` | `16` | Latent-length bucket size in patched steps; `1` disables padding |
 | `IRODORI_CUDA_GRAPH_CACHE` | `64` | Max cached graph entries (per-entry VRAM is small; pool and condition buffers are shared) |
