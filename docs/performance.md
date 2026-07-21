@@ -28,9 +28,7 @@ All optimizations are inference-only. Training code paths are untouched.
 | fp16 codec decode (decoder-only, deterministic algorithms) | CUDA only | ~58-60 dB SNR vs fp32 (inaudible, deterministic) | `IRODORI_DISABLE_FP16_DECODE=1` |
 | Text-length bucketing (short texts padded to 64 instead of max_text_len) | all | ~41 dB SNR for short texts (inaudible, deterministic) | `IRODORI_TEXT_BUCKETS=0` |
 | torch.compile-fused kernels replayed inside the CUDA step graphs (opt-in) | CUDA + Triton (Linux/WSL2) | different sampling trajectory (judge by ear); deterministic | `IRODORI_COMPILE=1` to enable |
-| Prewarm also warms codec decoder + watermarker | CUDA only | none | (part of Prewarm) |
 | Latent-length bucketing (graphs shared across lengths) | CUDA only | ~47 dB SNR when padding occurs (inaudible, deterministic) | `IRODORI_CUDA_GRAPH_BUCKET=1` |
-| Graph prewarm (runtime API + Gradio button) | CUDA only | - | (button; opt-in) |
 | LoRA hot-swap keeping cached graphs | CUDA only | tiny fp drift per swap | (checkbox; default off) |
 | Gradio: SilentCipher watermark toggle | - | none (watermark on by default) | - |
 | Gradio: offline-first HF checkpoint resolution | - | none | see limitations |
@@ -112,31 +110,29 @@ Requirements and behavior:
   compiler (`apt-get install build-essential`). On Windows-native (no
   Triton) leave it off; the flag only changes how kernels are generated, so
   everything else in this document applies unchanged.
-- Compilation happens during Prewarm / the first request's warmup, never
-  inside a capture (capture-time recompiles invalidate the capture; the
+- Compilation happens during the first request's warmup for each new shape,
+  never inside a capture (capture-time recompiles invalidate the capture; the
   runtime pre-builds the RoPE caches and avoids trace-unstable code paths to
-  guarantee this). Cold-cache Prewarm takes ~3.5 min; inductor's on-disk
-  cache cuts later processes to ~1 min.
+  guarantee this). A cold inductor cache costs ~3.5 min of compiles across
+  the full shape range; the on-disk cache cuts later processes to ~1 min.
 - Outputs change (fused kernels = different float schedule), like switching
   model precision: same seed remains deterministic - verified bit-identical
   across independent processes - but it is a different take than the
   non-compiled output. Judge by ear.
 - LoRA loading/switching changes module structure and triggers a one-time
-  recompile absorbed by the next warmup/prewarm; hot-swap keeps structures
+  recompile absorbed by the next warmup; hot-swap keeps structures
   and does not recompile.
 
-## Recommended Gradio Workflow
+## Graph Capture Lifecycle
 
-1. Load Model.
-2. Fill in the LoRA Adapter Directory (if any) **before** prewarming.
-3. Press **Prewarm Graphs** (Prewarm Max Seconds bounds the covered duration
-   range; 15 s ≈ 24 latent buckets × 2 text buckets = 48 graphs ≈ ~50 s
-   one-time cost; each graph entry holds ~16 MiB of driver-side memory, so
-   this is roughly 1-1.5 GiB of VRAM). Prewarm also runs one dummy codec
-   decode and watermark pass so the first real request skips their one-time
-   setup costs.
-4. Generate. Any text whose predicted duration falls inside the prewarmed
-   range takes the fast path from the first request.
+Graphs are captured lazily: the first request at a new shape (length bucket ×
+text bucket × candidate count × CFG configuration) pays a one-time capture
+cost (~1 s per shape; a few seconds for `num_candidates > 1`), and every
+following request with that shape replays the captured graph. The first
+request of a session additionally pays the one-time codec-decoder and
+watermarker setup (~40 ms each). There is no pre-capture step; in steady
+state the set of graphs converges to exactly the shapes the workload uses
+(each entry holds ~16 MiB of driver-side memory).
 
 Notes:
 
@@ -147,8 +143,8 @@ Notes:
   fresh capture per length bucket (one-time, ~1 s each).
 - The `predict_duration` stage (condition encoding + duration head) is also
   replayed as one CUDA graph (~14 ms -> ~3-4 ms per request on the reference
-  setup). It is captured during Prewarm (or lazily on the first eligible
-  request, ~0.1 s one-time) and validated bit-exact against eager at capture.
+  setup). It is captured lazily on the first eligible request (~0.1 s
+  one-time) and validated bit-exact against eager at capture.
   Only fixed-shape requests take this path: reference-audio and
   speaker-embedding requests, and non-default `max_text_len`, run the
   unchanged eager code. Unlike the sampler graphs, this graph is dropped on
@@ -231,25 +227,25 @@ the DACVAE decoder is **GPU-compute-bound**, not launch-bound:
   the first request, which is pure overhead for a single-generation process
   (~+0.5-1 s). Set `IRODORI_DISABLE_CUDA_GRAPH=1` for one-shot CLI runs, and
   keep `IRODORI_COMPILE` off there (a cold compile adds minutes).
-- **VRAM**: cached graphs add roughly 1-1.5 GiB after a 15 s prewarm
-  (24 latent buckets x 2 text buckets; ~16 MiB of driver-side graph memory
-  per entry, plus the shared memory pool and per-text-bucket condition
-  buffers). `IRODORI_TEXT_BUCKETS=0` roughly halves this. Upstream uses
-  correspondingly less.
+- **VRAM**: cached graphs add roughly 1-1.5 GiB once a workload has touched
+  the full 15 s duration range (24 latent buckets x 2 text buckets; ~16 MiB
+  of driver-side graph memory per entry, plus the shared memory pool and
+  per-text-bucket condition buffers). Workloads that use fewer shapes hold
+  proportionally fewer graphs. `IRODORI_TEXT_BUCKETS=0` roughly halves this.
+  Upstream uses correspondingly less.
 - **Offline-first checkpoint resolution**: the Gradio app now resolves
   HF-hub checkpoints from the local cache first. If the upstream repo
   publishes a newer `model.safetensors`, it is **not** picked up
   automatically while a cached copy exists; clear the HF cache entry (or
   download manually) to update.
-- **Gradio API surface**: `_run_generation` and the prewarm handler take
-  additional inputs (hot-swap flag, watermark flag, prewarm seconds), so
-  `gradio_client` calls written against upstream need their argument lists
-  updated.
+- **Gradio API surface**: `_run_generation` takes additional inputs
+  (hot-swap flag, watermark flag), so `gradio_client` calls written against
+  upstream need their argument lists updated.
 - **Reference-audio requests and per-request `max_text_len` overrides**
-  produce different conditioning shapes per request, so they re-capture per
-  shape instead of hitting prewarmed graphs (prewarm covers the
-  no-reference/LoRA path at each configured text bucket length and the
-  checkpoint's default text length).
+  produce different conditioning shapes per request, so each new reference
+  length captures its own graphs on first use. Speaker-embedding (SI) and
+  no-reference requests have stable conditioning shapes and reuse their
+  graphs across requests.
 - Upstream functionality is otherwise preserved. Configurations not eligible
   for the graph path (`joint`/`alternating` CFG, temporal rescale,
   speaker-KV scaling, non-CUDA devices) run through the unchanged eager
