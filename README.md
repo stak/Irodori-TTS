@@ -520,6 +520,12 @@ muddy, try the experimental `--mode concat`, which concatenates the token sequen
 instead of assuming token-slot correspondence. Embeddings blend meaningfully only when
 trained against the same base checkpoint.
 
+The blend itself is also available as a library function,
+`irodori_tts.speaker_inversion.blend_speaker_embeddings(embeddings, weights, mode=...)`,
+and the resulting tensor can be passed directly to the runtime via
+`SamplingRequest.ref_speaker_embedding` (an in-memory alternative to `ref_embed`), so
+callers such as servers can blend at request time without writing intermediate files.
+
 #### Speaker Inversion
 
 Speaker Inversion trains only a small set of speaker embedding tokens while keeping the

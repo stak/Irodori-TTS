@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -10,6 +11,7 @@ from safetensors.torch import save_file as save_safetensors_file
 SPEAKER_INVERSION_UNCOND_MODES = {"mask", "noise"}
 SPEAKER_INVERSION_SAFETENSORS_SUFFIX = ".speaker.safetensors"
 SPEAKER_EMBEDDING_KEY = "speaker_embedding"
+SPEAKER_INVERSION_BLEND_MODES = ("lerp", "concat")
 
 
 def normalize_speaker_embedding_tensor(
@@ -161,6 +163,76 @@ def save_speaker_inversion_safetensors(
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     save_safetensors_file(tensors, str(target), metadata={})
+
+
+def blend_speaker_embeddings(
+    embeddings: Sequence[torch.Tensor],
+    weights: Sequence[float],
+    *,
+    mode: str = "lerp",
+) -> torch.Tensor:
+    """Blend Speaker Inversion embeddings into a single (tokens, dim) tensor.
+
+    Interpolating between learned speaker embeddings rides the base model's
+    speaker-conditioning manifold, so the result is typically a natural
+    intermediate voice.
+
+    - ``lerp``: weighted mean of the token tensors (weights normalized to sum
+      to 1). Requires every source to have the same token count. Assumes token
+      slot i of one embedding corresponds to slot i of the other, which is not
+      guaranteed for independently trained runs -- it usually works, but if
+      the blended voice sounds muddy, try ``concat``.
+    - ``concat``: concatenates the token sequences (no slot-correspondence
+      assumption; token counts may differ). Each source's tokens are scaled by
+      ``normalized_weight * num_sources`` so equal weights reproduce a plain
+      concatenation. Experimental: scaling interacts nonlinearly with
+      attention, and the grown token count changes conditioning shapes.
+    """
+    if mode not in SPEAKER_INVERSION_BLEND_MODES:
+        raise ValueError(
+            f"Unknown blend mode {mode!r}. Use one of: {', '.join(SPEAKER_INVERSION_BLEND_MODES)}."
+        )
+    embeddings = list(embeddings)
+    weights = [float(w) for w in weights]
+    if not embeddings:
+        raise ValueError("Need at least one embedding to blend.")
+    if len(weights) != len(embeddings):
+        raise ValueError(
+            f"weights count ({len(weights)}) must match embeddings count ({len(embeddings)})."
+        )
+    if any(w <= 0.0 for w in weights):
+        raise ValueError("All blend weights must be > 0.")
+    for index, embedding in enumerate(embeddings):
+        if embedding.ndim != 2 or int(embedding.shape[0]) <= 0:
+            raise ValueError(
+                f"Blend source {index} must have shape (tokens, dim), "
+                f"got {tuple(embedding.shape)}."
+            )
+
+    total = sum(weights)
+    normalized = [w / total for w in weights]
+
+    dims = {int(e.shape[1]) for e in embeddings}
+    if len(dims) != 1:
+        raise ValueError(f"Speaker dims differ across sources: {sorted(dims)}")
+
+    if mode == "lerp":
+        token_counts = {int(e.shape[0]) for e in embeddings}
+        if len(token_counts) != 1:
+            raise ValueError(
+                "lerp requires identical token counts across sources, got "
+                f"{sorted(token_counts)}. Retrain with matching "
+                "speaker_inversion_tokens, or use the concat blend mode."
+            )
+        out = torch.zeros_like(embeddings[0])
+        for emb, weight in zip(embeddings, normalized, strict=True):
+            out += emb * weight
+        return out
+
+    scaled = [
+        emb * (weight * len(embeddings)) for emb, weight in zip(embeddings, normalized, strict=True)
+    ]
+    return torch.cat(scaled, dim=0)
 
 
 def speaker_inversion_batch_tensors(
