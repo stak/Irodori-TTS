@@ -30,6 +30,8 @@ import torch
 
 from irodori_tts.speaker_inversion import (
     SPEAKER_EMBEDDING_KEY,
+    SPEAKER_INVERSION_BLEND_MODES,
+    blend_speaker_embeddings,
     load_speaker_inversion_payload,
     save_speaker_inversion_safetensors,
 )
@@ -59,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("lerp", "concat"),
+        choices=SPEAKER_INVERSION_BLEND_MODES,
         default="lerp",
         help="Blend mode (default: lerp).",
     )
@@ -69,35 +71,6 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite an existing output file.",
     )
     return parser.parse_args()
-
-
-def blend_embeddings(
-    embeddings: list[torch.Tensor], weights: list[float], mode: str
-) -> torch.Tensor:
-    total = sum(weights)
-    normalized = [w / total for w in weights]
-
-    dims = {int(e.shape[1]) for e in embeddings}
-    if len(dims) != 1:
-        raise ValueError(f"Speaker dims differ across sources: {sorted(dims)}")
-
-    if mode == "lerp":
-        token_counts = {int(e.shape[0]) for e in embeddings}
-        if len(token_counts) != 1:
-            raise ValueError(
-                "lerp requires identical token counts across sources, got "
-                f"{sorted(token_counts)}. Retrain with matching "
-                "speaker_inversion_tokens, or use --mode concat."
-            )
-        out = torch.zeros_like(embeddings[0])
-        for emb, weight in zip(embeddings, normalized, strict=True):
-            out += emb * weight
-        return out
-
-    scaled = [
-        emb * (weight * len(embeddings)) for emb, weight in zip(embeddings, normalized, strict=True)
-    ]
-    return torch.cat(scaled, dim=0)
 
 
 def main() -> None:
@@ -118,7 +91,7 @@ def main() -> None:
         raise FileExistsError(f"Output already exists: {output} (use --force)")
 
     embeddings = [load_speaker_inversion_payload(path)[SPEAKER_EMBEDDING_KEY] for path in sources]
-    blended = blend_embeddings(embeddings, weights, args.mode)
+    blended = blend_speaker_embeddings(embeddings, weights, mode=args.mode)
     save_speaker_inversion_safetensors(output, {SPEAKER_EMBEDDING_KEY: blended})
 
     reloaded = load_speaker_inversion_payload(output)[SPEAKER_EMBEDDING_KEY]

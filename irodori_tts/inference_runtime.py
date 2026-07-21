@@ -36,6 +36,7 @@ from .rf import (
 )
 from .speaker_inversion import (
     load_speaker_inversion_payload,
+    normalize_speaker_embedding_tensor,
     speaker_inversion_batch_tensors,
 )
 from .text_normalization import normalize_text
@@ -275,6 +276,10 @@ class SamplingRequest:
     # encode). Cannot be combined with ref_wav/ref_latent/ref_embed.
     ref_audio: torch.Tensor | None = None
     ref_audio_sample_rate: int | None = None
+    # In-memory alternative to ref_embed: a Speaker Inversion embedding of
+    # shape (tokens, speaker_dim), e.g. produced by blend_speaker_embeddings.
+    # Follows the same exclusivity rules as ref_embed.
+    ref_speaker_embedding: torch.Tensor | None = None
     ref_normalize_db: float | None = -16.0
     ref_ensure_max: bool = True
     num_candidates: int = 1
@@ -1023,13 +1028,18 @@ class InferenceRuntime:
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        if req.ref_embed is None:
+        if req.ref_embed is None and req.ref_speaker_embedding is None:
             return None, None
         if not self.model_cfg.use_speaker_condition_resolved:
             messages.append(
                 "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
             )
             return None, None
+        if req.ref_embed is not None and req.ref_speaker_embedding is not None:
+            raise ValueError(
+                "ref_embed cannot be combined with ref_speaker_embedding. "
+                "Use exactly one speaker conditioning source."
+            )
         if (
             req.ref_wav is not None
             or req.ref_latent is not None
@@ -1037,12 +1047,20 @@ class InferenceRuntime:
             or req.no_ref
         ):
             raise ValueError(
-                "ref_embed/--ref-embed cannot be combined with ref_wav/ref_latent/ref_audio/"
-                "no_ref. Use exactly one speaker conditioning source."
+                "ref_embed/ref_speaker_embedding cannot be combined with ref_wav/ref_latent/"
+                "ref_audio/no_ref. Use exactly one speaker conditioning source."
             )
 
         runtime_dtype = next(self.model.parameters()).dtype
-        speaker_embedding = load_speaker_inversion_payload(req.ref_embed)["speaker_embedding"]
+        if req.ref_speaker_embedding is not None:
+            speaker_embedding = normalize_speaker_embedding_tensor(
+                req.ref_speaker_embedding,
+                speaker_dim=int(self.model_cfg.speaker_dim),
+            )
+            source = "in-memory"
+        else:
+            speaker_embedding = load_speaker_inversion_payload(req.ref_embed)["speaker_embedding"]
+            source = "file"
         state, mask = speaker_inversion_batch_tensors(
             speaker_embedding,
             batch_size=batch_size,
@@ -1050,7 +1068,7 @@ class InferenceRuntime:
             dtype=runtime_dtype,
         )
         messages.append(
-            "info: using speaker inversion embedding "
+            f"info: using speaker inversion embedding ({source}) "
             f"tokens={state.shape[1]} uncond_mode={req.speaker_uncond_mode}."
         )
         return state, mask
