@@ -19,6 +19,7 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
+from . import perf_profile
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
@@ -113,12 +114,13 @@ def _enable_cuda_fast_math() -> None:
     """
     Allow TF32 tensor-core execution for fp32 matmuls/convolutions and enable
     cuDNN autotuning. Gives a large speedup on Ampere+ GPUs with negligible
-    numerical impact. Opt out with IRODORI_DISABLE_TF32=1.
+    numerical impact. On under IRODORI_PERF_PROFILE=recommended; override
+    with IRODORI_DISABLE_TF32.
     """
     global _FAST_MATH_CONFIGURED
     if _FAST_MATH_CONFIGURED:
         return
-    if os.environ.get("IRODORI_DISABLE_TF32", "0").strip() == "1":
+    if not perf_profile.optimization_enabled("IRODORI_DISABLE_TF32"):
         _FAST_MATH_CONFIGURED = True
         return
     # TF32 for matmuls only. Empirically, forcing TF32/cudnn-benchmark on the
@@ -142,10 +144,11 @@ def _text_bucket_lengths() -> list[int]:
     Text-length buckets (in tokens). Short texts are padded to the smallest
     bucket that fits instead of the checkpoint's full max_text_len, shrinking
     the per-step cross-attention over masked padding keys. Comma-separated in
-    IRODORI_TEXT_BUCKETS; empty or "0" disables bucketing (always pad to
-    max_text_len, the upstream behavior).
+    IRODORI_TEXT_BUCKETS; "0" disables bucketing (always pad to max_text_len,
+    the upstream behavior). Unset or empty, the profile decides
+    (recommended: 64, upstream: disabled).
     """
-    raw = os.environ.get("IRODORI_TEXT_BUCKETS", "64").strip()
+    raw = perf_profile.text_buckets_raw()
     if raw in {"", "0"}:
         return []
     lengths = []
@@ -754,8 +757,8 @@ class InferenceRuntime:
         used inside the graph is replaced wholesale (modules_to_save) and the
         previous adapter was actually merged.
         """
-        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
-            return False, "LoRA merge is disabled (IRODORI_DISABLE_LORA_MERGE=1)"
+        if not perf_profile.optimization_enabled("IRODORI_DISABLE_LORA_MERGE"):
+            return False, "LoRA merge is disabled (profile or IRODORI_DISABLE_LORA_MERGE)"
         if (
             self._last_lora_token not in (None, "__base__")
             and self._merged_lora_path != self._last_lora_token
@@ -792,7 +795,7 @@ class InferenceRuntime:
             # The duration/condition graph bakes in modules the sampler graphs
             # never touch (duration_predictor, which hot-swap explicitly allows
             # in modules_to_save), so it cannot survive any adapter switch.
-            # Recapture is cheap and happens on the next request/prewarm.
+            # Recapture is cheap and happens on the next request.
             self._cuda_graph_cache.pop("__duration__", None)
             cached_graphs = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
             preserved = False
@@ -818,8 +821,8 @@ class InferenceRuntime:
                 if cached_graphs > 0:
                     msg = (
                         f"warning: LoRA state changed ({self._last_lora_token} -> {lora_token}); "
-                        f"dropped {cached_graphs} cached CUDA graphs. Prewarm again with the same "
-                        "LoRA Adapter Directory, or enable LoRA Hot-Swap to keep them."
+                        f"dropped {cached_graphs} cached CUDA graphs. They are recaptured on the "
+                        "next requests; enable LoRA Hot-Swap to keep them across switches."
                     )
                     messages.append(msg)
                     log_fn(msg)
@@ -837,7 +840,8 @@ class InferenceRuntime:
         if getattr(self.model, "_irodori_compiled", False):
             msg = (
                 "info: torch.compile is active; the LoRA structure change triggers a "
-                "one-time recompile during the next warmup (prewarm absorbs it)."
+                "one-time recompile during the next warmup (the precompile script "
+                "absorbs it when run with the same adapter)."
             )
             messages.append(msg)
             log_fn(msg)
@@ -890,7 +894,7 @@ class InferenceRuntime:
         extra low-rank matmuls on every forward pass. Mathematically equivalent
         (up to float rounding) to running with an unmerged adapter.
         """
-        if os.environ.get("IRODORI_DISABLE_LORA_MERGE", "0").strip() == "1":
+        if not perf_profile.optimization_enabled("IRODORI_DISABLE_LORA_MERGE"):
             return
         merge_adapter = getattr(self.model, "merge_adapter", None)
         if not callable(merge_adapter):
@@ -1137,8 +1141,8 @@ class InferenceRuntime:
             graph_eligible
             and speaker_state_override is None
             and self.model_device.type == "cuda"
-            and os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() != "1"
-            and os.environ.get("IRODORI_DISABLE_DURATION_GRAPH", "0").strip() != "1"
+            and perf_profile.optimization_enabled("IRODORI_DISABLE_CUDA_GRAPH")
+            and perf_profile.optimization_enabled("IRODORI_DISABLE_DURATION_GRAPH")
             and not self._cuda_graph_cache.get("__duration_disabled__", False)
         )
         if not graph_supported:
@@ -1710,254 +1714,6 @@ class InferenceRuntime:
             messages=messages,
             used_seeds=used_seeds,
         )
-
-    def prewarm_cuda_graphs(
-        self,
-        *,
-        lora_adapter: str | None = None,
-        lora_hot_swap: bool = False,
-        max_seconds: float = 15.0,
-        num_steps: int = 40,
-        num_candidates: int = 1,
-        cfg_guidance_mode: str = "independent",
-        cfg_scale_text: float = 3.0,
-        cfg_scale_caption: float = 3.0,
-        cfg_scale_speaker: float = 5.0,
-        cfg_scale: float | None = None,
-        cfg_min_t: float = 0.5,
-        cfg_max_t: float = 1.0,
-        context_kv_cache: bool = True,
-        t_schedule_mode: str = "linear",
-        sway_coeff: float = -1.0,
-        log_fn: Callable[[str], None] | None = None,
-    ) -> str:
-        """
-        Capture CUDA graphs for every latent-length bucket up to max_seconds so
-        the first real generation of any duration takes the fast replay path.
-        Graphs are captured for the no-reference (LoRA / base voice) request
-        shape; requests with reference audio still capture on first use.
-        """
-
-        def _log(msg: str) -> None:
-            if log_fn is not None:
-                log_fn(msg)
-
-        if self.model_device.type != "cuda":
-            return "prewarm skipped: model device is not CUDA."
-        if os.environ.get("IRODORI_DISABLE_CUDA_GRAPH", "0").strip() == "1":
-            return "prewarm skipped: IRODORI_DISABLE_CUDA_GRAPH=1."
-        if float(max_seconds) <= 0:
-            return "prewarm skipped: max_seconds must be > 0."
-
-        messages: list[str] = []
-        stage_timings: list[tuple[str, float]] = []
-        bucket = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_BUCKET", "16")))
-        hop_length = int(self.codec.model.hop_length)
-        max_frames = max(1, math.ceil(float(max_seconds) * self.codec.sample_rate / hop_length))
-        max_patched = math.ceil(max_frames / self.model_cfg.latent_patch_size)
-        max_padded = ((max_patched + bucket - 1) // bucket) * bucket
-        lengths = list(range(bucket, max_padded + 1, bucket))
-        # One sampler-graph entry is captured per (text bucket, latent bucket)
-        # pair; the largest text length (max_text_len, i.e. no bucketing) is
-        # always covered so long texts stay on the fast path.
-        text_lengths = sorted(
-            {
-                int(self.default_text_max_len),
-                *[
-                    b
-                    for b in _text_bucket_lengths()
-                    if b < int(self.default_text_max_len)
-                ],
-            },
-            reverse=True,
-        )
-        max_entries = max(1, int(os.environ.get("IRODORI_CUDA_GRAPH_CACHE", "64")))
-        per_text_budget = max(1, max_entries // len(text_lengths))
-        if len(lengths) > per_text_budget:
-            # Keep the shortest buckets: short utterances are by far the most
-            # common, so they must stay covered when the cache cannot hold all.
-            lengths = lengths[:per_text_budget]
-            messages.append(
-                f"warning: prewarm truncated to {per_text_budget} latent buckets per text bucket "
-                f"(covers up to {lengths[-1] * self.model_cfg.latent_patch_size * hop_length / self.codec.sample_rate:.1f}s); "
-                "raise IRODORI_CUDA_GRAPH_CACHE or IRODORI_CUDA_GRAPH_BUCKET to cover more."
-            )
-        # Capture the largest bucket first so the shared memory pool is sized
-        # once and smaller graphs reuse its blocks.
-        lengths = sorted(lengths, reverse=True)
-
-        t_start = time.perf_counter()
-        with (
-            self._infer_lock,
-            self._prepare_lora_for_request(
-                lora_adapter,
-                messages=messages,
-                stage_timings=stage_timings,
-                log_fn=_log,
-                hot_swap=bool(lora_hot_swap),
-            ),
-            torch.inference_mode(),
-        ):
-            text_ids_full, text_mask_full = self.tokenizer.batch_encode(
-                ["こんにちは。"] * int(num_candidates),
-                max_length=self.default_text_max_len,
-            )
-            caption_ids = None
-            caption_mask = None
-            if self.model_cfg.use_caption_condition and self.caption_tokenizer is not None:
-                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [""] * int(num_candidates),
-                    max_length=self.default_caption_max_len,
-                )
-                caption_mask.zero_()
-                caption_ids = caption_ids.to(self.model_device)
-                caption_mask = caption_mask.to(self.model_device)
-            ref_latent, ref_mask = self._load_reference_latent(
-                req=SamplingRequest(text="prewarm", no_ref=True),
-                batch_size=int(num_candidates),
-                messages=messages,
-            )
-            scale_text, scale_caption, scale_speaker, _ = resolve_cfg_scales(
-                cfg_guidance_mode=cfg_guidance_mode,
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_scale=cfg_scale,
-                use_caption_condition=False,
-                use_speaker_condition=False,
-            )
-            prewarm_has_speaker = torch.zeros(
-                (int(num_candidates),), dtype=torch.bool, device=self.model_device
-            )
-            if ref_mask is not None:
-                prewarm_has_speaker = ref_mask.any(dim=1)
-            prewarm_features = build_duration_features(
-                ["こんにちは。"] * int(num_candidates),
-                token_counts=text_mask_full.sum(dim=1),
-                max_text_len=self.default_text_max_len,
-                has_speaker=prewarm_has_speaker,
-            ).to(self.model_device)
-            prewarm_has_caption = (
-                torch.zeros((int(num_candidates),), dtype=torch.bool, device=self.model_device)
-                if self.model_cfg.use_caption_condition
-                else None
-            )
-            for text_len in text_lengths:
-                # Tokenization is right-padded, so slicing the full-length
-                # batch equals re-encoding at the bucket length.
-                text_ids = text_ids_full[:, :text_len].contiguous().to(self.model_device)
-                text_mask = text_mask_full[:, :text_len].contiguous().to(self.model_device)
-                if self.model_cfg.use_duration_predictor:
-                    # Capture the duration/condition graph too, so the first
-                    # real request skips its one-time capture cost. Shapes
-                    # (not values) key the graph, so the placeholder text is
-                    # irrelevant.
-                    encoded_conditions, _ = self._encode_and_predict_duration(
-                        text_ids=text_ids,
-                        text_mask=text_mask,
-                        ref_latent=ref_latent,
-                        ref_mask=ref_mask,
-                        caption_ids=caption_ids,
-                        caption_mask=caption_mask,
-                        speaker_state_override=None,
-                        speaker_mask_override=None,
-                        speaker_uncond_mode="mask",
-                        duration_features=prewarm_features,
-                        has_speaker=prewarm_has_speaker,
-                        has_caption=prewarm_has_caption,
-                        graph_eligible=True,
-                        log_fn=_log,
-                    )
-                else:
-                    encoded_conditions = self.model.encode_conditions(
-                        text_input_ids=text_ids,
-                        text_mask=text_mask,
-                        ref_latent=ref_latent,
-                        ref_mask=ref_mask,
-                        caption_input_ids=caption_ids,
-                        caption_mask=caption_mask,
-                    )
-                for seq_len in lengths:
-                    sample_euler_rf_cfg(
-                        model=self.model,
-                        text_input_ids=text_ids,
-                        text_mask=text_mask,
-                        ref_latent=ref_latent,
-                        ref_mask=ref_mask,
-                        sequence_length=int(seq_len),
-                        caption_input_ids=caption_ids,
-                        caption_mask=caption_mask,
-                        num_steps=int(num_steps),
-                        cfg_scale_text=scale_text,
-                        cfg_scale_caption=scale_caption,
-                        cfg_scale_speaker=scale_speaker,
-                        cfg_guidance_mode=str(cfg_guidance_mode),
-                        cfg_min_t=float(cfg_min_t),
-                        cfg_max_t=float(cfg_max_t),
-                        seed=0,
-                        use_context_kv_cache=bool(context_kv_cache),
-                        t_schedule_mode=str(t_schedule_mode),
-                        sway_coeff=float(sway_coeff),
-                        cuda_graph_cache=self._cuda_graph_cache,
-                        encoded_conditions=encoded_conditions,
-                    )
-                    _log(
-                        f"[runtime] prewarm: captured graph for {seq_len} patched steps "
-                        f"(text {text_len})"
-                    )
-                    if self._cuda_graph_cache.get("__disabled__", False):
-                        return (
-                            "prewarm aborted: CUDA graph capture failed; running in eager mode."
-                        )
-
-        # Release cached (non-graph) allocator blocks accumulated by the warmup
-        # runs; graph private pools are owned by the graphs and stay intact.
-        if self.model_device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        # Warm the decode/watermark stages last (after empty_cache, so their
-        # working-set allocations survive into the first real request). The
-        # first decode/watermark calls otherwise pay one-time cuDNN plan and
-        # allocator-growth costs of ~40 ms each. Sized to the prewarmed
-        # duration range so shorter real requests fit within the warmed blocks.
-        with self._infer_lock, torch.inference_mode():
-            if self.codec.device.type == "cuda":
-                dummy_latent = torch.zeros(
-                    (1, int(max_frames), self.codec.latent_dim),
-                    device=self.codec.device,
-                    dtype=torch.float32,
-                )
-                self.codec.decode_latent(dummy_latent)
-                _log("[runtime] prewarm: warmed codec decoder")
-
-            if self.watermarker.ready:
-                # Deterministic dummy signal so global RNG state stays
-                # untouched.
-                try:
-                    sample_rate = int(self.codec.sample_rate)
-                    t = torch.arange(int(max_frames) * hop_length, dtype=torch.float32)
-                    dummy_audio = (0.1 * torch.sin(2.0 * math.pi * 440.0 * t / sample_rate))[
-                        None, :
-                    ]
-                    self.watermarker.encode_batch([dummy_audio], sample_rate=sample_rate)
-                    _log("[runtime] prewarm: warmed watermarker")
-                except Exception as exc:  # pragma: no cover - defensive
-                    _log(f"[runtime] prewarm: watermark warmup skipped ({exc!r})")
-
-        elapsed = time.perf_counter() - t_start
-        graph_count = len([k for k in self._cuda_graph_cache if not isinstance(k, str)])
-        lora_note = self._last_lora_token if self._last_lora_token is not None else "__base__"
-        summary = (
-            f"prewarmed {len(lengths)} length buckets x {len(text_lengths)} text buckets "
-            f"(<= {float(max_seconds):.1f}s) in {elapsed:.1f}s; graphs cached: {graph_count}\n"
-            f"lora: {lora_note}\n"
-            "note: graphs are dropped if the LoRA Adapter Directory changes, "
-            "unless LoRA Hot-Swap is enabled."
-        )
-        for msg in messages:
-            _log(msg)
-        _log(f"[runtime] {summary}")
-        return summary
 
     def unload(self) -> None:
         self._cuda_graph_cache.clear()
